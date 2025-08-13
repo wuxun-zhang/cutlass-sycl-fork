@@ -111,9 +111,14 @@ struct XeFlashDecodeIndividualTileScheduler {
       TileShape const& tile_shape) {
     using namespace cute;
     // problem_size = [batch, num_heads_q, num_heads_kv, seq_len_qo, seq_len_kv, seq_len_kv_cache, head_size_qk, head_size_vo]
+    // dim3 grid(size(ceil_div(shape<7>(problem_size), shape<1>(tile_shape))),
+    //           size(ceil_div(shape<3>(problem_size), 8)), // we want to process only 8 tokens per workgroup
+    //           size(shape<0>(problem_size) * shape<1>(problem_size)));
+    // use num_kv_heads to set num of work groups
     dim3 grid(size(ceil_div(shape<7>(problem_size), shape<1>(tile_shape))),
               size(ceil_div(shape<3>(problem_size), 8)), // we want to process only 8 tokens per workgroup
-              size(shape<0>(problem_size) * shape<1>(problem_size)));
+              size(shape<0>(problem_size) * shape<2>(problem_size)));
+    // std::cout << "\nWuxun debug>> XeFlashDecodeIndividualTileScheduler grid shape: [" << grid.x << ", " << grid.y << ", " << grid.z << "]\n";
     return Params{ grid, {shape<1>(problem_size)} };
   }
 

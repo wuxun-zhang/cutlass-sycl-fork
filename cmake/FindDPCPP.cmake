@@ -38,7 +38,7 @@ find_library(DPCPP_LIB_DIR NAMES sycl sycl6 PATHS "${DPCPP_BIN_DIR}/../lib")
 
 add_library(DPCPP::DPCPP INTERFACE IMPORTED)
 
-set(DPCPP_FLAGS "-fsycl;")
+set(DPCPP_FLAGS "-fsycl;-gline-tables-only;-fdebug-info-for-profiling")
 set(DPCPP_COMPILE_ONLY_FLAGS "")
 
 if(NOT "${DPCPP_SYCL_TARGET}" STREQUAL "")
