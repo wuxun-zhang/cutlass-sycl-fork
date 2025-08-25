@@ -97,7 +97,8 @@ int main(int argc, const char **argv) {
   } else if(options.varlen && options.use_paged_kv) {
     return run_decode<512, 8, true, true>(options);
   } else if(!options.varlen && !options.use_paged_kv) {
-    return run_decode<512, 8, false, false>(options);
+    // return run_decode<512, 8, false, false>(options);
+    return run_decode<256, 8, false, false>(options);
   } else if(!options.varlen && options.use_paged_kv) {
     return run_decode<512, 8, true, false>(options);
   }

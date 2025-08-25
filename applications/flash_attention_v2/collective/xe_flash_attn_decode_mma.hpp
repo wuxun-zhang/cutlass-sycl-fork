@@ -256,7 +256,7 @@ struct FlashDecodeMma<gemm::MainloopIntelXeXMX16<Stages>, ProblemShapeType_, Ele
 
 #if CUTLASS_ENABLE_DEBUG_PRINTS
 #define PRINT(x) print(#x ": "); print(x); print("\n");
-  if (cute::thread(LOG_THREAD, LOG_GROUP)) {
+  if (cute::thread(0, 0)) {
     print("======================= Q: \n");
     PRINT(gQ);
     PRINT(tCrQ);
@@ -329,7 +329,7 @@ struct FlashDecodeMma<gemm::MainloopIntelXeXMX16<Stages>, ProblemShapeType_, Ele
 
 #if CUTLASS_ENABLE_DEBUG_PRINTS
 #define PRINT(x) print(#x ": "); print(x); print("\n");
-  if (cute::thread(LOG_THREAD, LOG_GROUP)) {
+  if (cute::thread(0, 0)) {
     print("=====================  V :\n");
     PRINT(gV);
     PRINT(gV_);
