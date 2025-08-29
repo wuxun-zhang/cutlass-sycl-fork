@@ -134,7 +134,9 @@ struct FlashDecodeMma<gemm::MainloopIntelXeXMX16<Stages>, ProblemShapeType_, Ele
   static constexpr auto PV_BLK_K = get<2>(TileShapePV{});
 
   // (8, 32, 64)
-  using SubgroupTileShapePV = decltype(make_shape(get<0>(TileShapePV{}), get<1>(TileShapePV{}), Int<get<2>(TileShapePV{}) / ATOM_M>{}));
+  // using SubgroupTileShapePV = decltype(make_shape(get<0>(TileShapePV{}), get<1>(TileShapePV{}), Int<get<2>(TileShapePV{}) / ATOM_M>{}));
+  // (8, 32, 16)
+  using SubgroupTileShapePV = decltype(make_shape(get<0>(TileShapePV{}), get<1>(TileShapePV{}), Int<16>{}));
 
   static constexpr bool is_var_len = cutlass::fmha::collective::is_variable_length_v<tuple_element_t<3, ProblemShapeType>>;
 
