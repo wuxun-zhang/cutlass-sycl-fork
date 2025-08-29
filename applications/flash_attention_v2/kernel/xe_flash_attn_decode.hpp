@@ -271,8 +271,9 @@ public:
 
       // TODO: not consider var_len yet
       // each work group currently only handle half of query heads
-      auto blk_l_coord =  batch_coord * num_heads_q + num_heads_coord * (group_heads_q / 2);
-      auto blk_l_coord_kv = batch_coord * num_heads_kv + num_heads_coord / 2;
+      const int num_query_heads_per_wg = 2;
+      auto blk_l_coord =  batch_coord * num_heads_q + num_heads_coord * (group_heads_q / num_query_heads_per_wg);
+      auto blk_l_coord_kv = batch_coord * num_heads_kv + num_heads_coord / num_query_heads_per_wg;
 
       // Get problem shape for the current batch_blk_idx. For variable sequence length, it loads the sequence length
       // from Global memory for the given batch_blk_idx and returns the appropriate problem_shape. For fixed sequence
@@ -477,7 +478,7 @@ public:
         // Tensor shmem_max_tensor = make_tensor(make_smem_ptr(smem), make_shape(Int<Num_SGs * FragsM>{}));
 
         // assum group_heads_q == 4
-        const int query_head_loops = 2;
+        const int query_head_loops = num_query_heads_per_wg;
         cutlass::Array<ElementAccumulator, query_head_loops> max_regs;
         cutlass::Array<ElementAccumulator, query_head_loops> sum_regs;
         cutlass::Array<decltype(make_tensor<ElementAccumulator>(AccumShape{})), query_head_loops> out_regs;
