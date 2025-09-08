@@ -30,6 +30,7 @@
  **************************************************************************************************/
 #pragma once
 
+#include "cutlass/gpu_generics.h"
 #include "cutlass/cutlass.h"
 #include "cutlass/gemm/dispatch_policy.hpp"
 #include "cutlass/gemm/gemm.h"
@@ -214,7 +215,7 @@ public:
     }
   }
 
-  #define ENABLE_DEBUG_PRINT 1
+  #define ENABLE_DEBUG_PRINT 0
 
   CUTLASS_DEVICE
   void operator()(Params const &params, char *smem_buf) {
@@ -244,7 +245,10 @@ public:
     TileScheduler tile_scheduler{params.scheduler};
 
     auto work_group_id = syclcompat::work_group_id::z();
-    syclcompat::atomic<int32_t*, sycl::memory_scope::device, sycl::memory_order::relaxed, sycl::access::address_space::generic_space> load_counter(params.load_ready_counter + work_group_id);
+    // sync point between prefetch wg and compute wg. Prefetch wg will increment
+    // its own atomic counter till prefetch_step_limit, then wait for compute wg to
+    // decrement it to less than prefetch_step_limit.
+    const int prefetch_step_limit = 5;
 
     CUTLASS_PRAGMA_NO_UNROLL
     for (; tile_scheduler.is_valid(); ++tile_scheduler) {
@@ -348,8 +352,8 @@ public:
         }
       }
 
-      // memory prefetch work group
-      if (syclcompat::work_group_id::y() == 1 && load_counter.load() == 0) {
+      // firstly start prefetch work
+      if (syclcompat::work_group_id::y() == 1) {
 #if ENABLE_DEBUG_PRINT
       if (syclcompat::work_group_id::z() == 0 && syclcompat::local_id::x() == 0) {
         cute::print("\nWuxun debug>>> load work group %d, prefetch Q and K\n", syclcompat::work_group_id::y());
@@ -389,22 +393,11 @@ public:
 
       ElementAccumulator max_reg = ElementAccumulator{-INFINITY};
       auto sum_reg = ElementAccumulator{0};
-      decltype(make_tensor<ElementAccumulator>(AccumShape{})) out_reg;
-      // clear(out_reg);
+      auto out_reg = make_tensor<ElementAccumulator>(AccumShape{});
+      clear(out_reg);
 
-      ElementAccumulator* smem = nullptr;
-      // auto smem = syclcompat::local_mem<ElementAccumulator[((Int<size(AccumShape{}) + 1>{}) * Num_SGs * SubgroupSize)]>();
-      // Tensor shmem_max_tensor = make_tensor(make_smem_ptr(smem), make_shape(Int<Num_SGs * FragsM>{}));
-      decltype(make_tensor(make_smem_ptr<ElementAccumulator>(nullptr), make_shape(Int<Num_SGs * FragsM>{}))) shmem_max_tensor;
-
-      // compuate work group
-      if (syclcompat::work_group_id::y() == 0) {
-        out_reg = make_tensor<ElementAccumulator>(AccumShape{});
-        clear(out_reg);
-
-        smem = syclcompat::local_mem<ElementAccumulator[((Int<size(AccumShape{}) + 1>{}) * Num_SGs * SubgroupSize)]>();
-        shmem_max_tensor = make_tensor(make_smem_ptr(smem), make_shape(Int<Num_SGs * FragsM>{}));
-      }
+      auto smem = syclcompat::local_mem<ElementAccumulator[((Int<size(AccumShape{}) + 1>{}) * Num_SGs * SubgroupSize)]>();
+      Tensor shmem_max_tensor = make_tensor(make_smem_ptr(smem), make_shape(Int<Num_SGs * FragsM>{}));
 
       bool is_KV_cache = seq_len_kv_cache != 0;
 
@@ -414,10 +407,9 @@ public:
                                            : (split - kv_splits_cache) * ATOM_M + kv_tile_idx;
 
         if (syclcompat::work_group_id::y() == 1) {
-          while (load_counter.load()) {}
 #if ENABLE_DEBUG_PRINT
       if (syclcompat::work_group_id::z() == 0 && syclcompat::local_id::x() == 0) {
-        cute::print("\nWuxun debug>>> load work group %d, prefetch V\n", syclcompat::work_group_id::y());
+        cute::print("\nWuxun debug>>> load work group %d, prefetch V split %d\n", syclcompat::work_group_id::y(), split);
       }
 #endif
           // each sub-group gets a different base offset for prefetch to load it's own
@@ -431,24 +423,19 @@ public:
           // make prefetch data ready for compute
           // only one work item to store
           if (syclcompat::local_id::x() == 0) {
-            load_counter.store(1);
-            // syclcompat::atomic_fetch_add(params.load_ready_counter + work_group_id, (int32_t)1);
+            atomicAdd(params.load_ready_counter + work_group_id, 1);
           }
         }
 
-        decltype(make_tensor<ElementAccumulator>(Shape<Int<Vec>, Int<FragsM>, Int<FragsN>>{})) tSr;
+        auto tSr = make_tensor<ElementAccumulator>(Shape<Int<Vec>, Int<FragsM>, Int<FragsN>>{});
+        clear(tSr);
 
         if (syclcompat::work_group_id::y() == 0) {
-          while (load_counter.load() == 0) {}
-          // while(syclcompat::atomic_fetch_sub(params.load_ready_counter + work_group_id, 1) == 1) {}
 #if ENABLE_DEBUG_PRINT
       if (syclcompat::work_group_id::z() == 0 && syclcompat::local_id::x() == 0) {
         cute::print("\nWuxun debug>>> compute work group %d\n", syclcompat::work_group_id::y());
       }
 #endif
-          tSr = make_tensor<ElementAccumulator>(Shape<Int<Vec>, Int<FragsM>, Int<FragsN>>{});
-          clear(tSr);
-
           // Perform GEMM S = Q*K
           collective_mma.mmaQK(tSr, gQ, gK(_, _, curr_kv_tile_idx / ATOM_M, _), tSr, ceil_div(head_size_qk, QK_BLK_K), mainloop_params, is_KV_cache, curr_kv_tile_idx % ATOM_M);
 
@@ -462,19 +449,19 @@ public:
           if (syclcompat::local_id::x() == 0) {
 #if ENABLE_DEBUG_PRINT
             if (syclcompat::work_group_id::z() == 0) {
-              cute::print("Wuxun debug>>> wg %d reset load counter to 0, ready for next prefetch\n", syclcompat::work_group_id::y());
+              cute::print("Wuxun debug>>> wg %d reset load counter to 0, finished K/V split %d, ready for next prefetch\n", syclcompat::work_group_id::y(), split);
             }
 #endif
-            load_counter.store(0);
-            // syclcompat::atomic_fetch_sub(params.load_ready_counter + work_group_id, (int32_t)1);
+            atomicSub(params.load_ready_counter + work_group_id, 1);
           }
         }
 
         if (syclcompat::work_group_id::y() == 1) {
-          while (load_counter.load()) {}
+          while (atomicLoad(params.load_ready_counter + work_group_id) == prefetch_step_limit
+            && prefetch_step_limit - atomicLoad(params.load_ready_counter + work_group_id) > 4) {}
 #if ENABLE_DEBUG_PRINT
       if (syclcompat::work_group_id::z() == 0 && syclcompat::local_id::x() == 0) {
-        cute::print("\nWuxun debug>>> load work group %d, prefetch next Q and K\n", syclcompat::work_group_id::y());
+        cute::print("\nWuxun debug>>> load work group %d, prefetch next Q and K split %d\n", syclcompat::work_group_id::y(), (split + 1));
       }
 #endif
           bool is_next_KV_cache = split + 1 < kv_splits_cache;
