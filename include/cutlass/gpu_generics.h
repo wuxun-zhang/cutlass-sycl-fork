@@ -383,7 +383,7 @@ CUTLASS_DEVICE int atomicCAS(int *address, int compare, int val) {
 CUTLASS_DEVICE int atomicLoad(int *address) {
   int result = 0;
 #if defined(__SYCL_DEVICE_ONLY__)
-  auto atm = sycl::atomic_ref<int, sycl::memory_order::relaxed, sycl::memory_scope::device, sycl::access::address_space::generic_space>(address[0]);
+  auto atm = sycl::atomic_ref<int, sycl::memory_order::relaxed, sycl::memory_scope::device, sycl::access::address_space::global_space>(address[0]);
   result = atm.load();
 #endif
   return result;

@@ -74,6 +74,11 @@ public:
   using MainloopArguments = typename CollectiveMainloop::Arguments;
   using MainloopParams = typename CollectiveMainloop::Params;
 
+  using traits_load_Q = typename CollectiveMainloop::traits_load_Q;
+  using atom_load_Q = typename CollectiveMainloop::atom_load_K;
+  using atom_load_K = typename CollectiveMainloop::atom_load_Q;
+  using atom_load_V = typename CollectiveMainloop::atom_load_V;
+
   using CollectiveSoftmaxEpilogue = CollectiveSoftmaxEpilogue_;
   using SoftmaxArguments = typename CollectiveSoftmaxEpilogue::Arguments;
   using SoftmaxParams = typename CollectiveSoftmaxEpilogue::Params;
@@ -244,11 +249,19 @@ public:
 
     TileScheduler tile_scheduler{params.scheduler};
 
+    // first 10 work-groups are load work-groups
+    // second 10 work-groups are compute work-groups
+    auto work_group_linear_id = syclcompat::get_nd_item<3>().get_group_linear_id();
     auto work_group_id = syclcompat::work_group_id::z();
     // sync point between prefetch wg and compute wg. Prefetch wg will increment
     // its own atomic counter till prefetch_step_limit, then wait for compute wg to
     // decrement it to less than prefetch_step_limit.
     const int prefetch_step_limit = 5;
+    const bool use_linear_wg_id = false;
+    const int LOAD_WG_ID = use_linear_wg_id ? (work_group_linear_id % (batch * num_heads_q)) : work_group_id;
+    const int COMPUTE_WG_ID = use_linear_wg_id ? (work_group_linear_id % (batch * num_heads_q)) : work_group_id;
+    const bool is_load_wg = use_linear_wg_id ? (work_group_linear_id < (batch * num_heads_q)) : (syclcompat::work_group_id::y() == 1);
+    const bool is_compute_wg = use_linear_wg_id ? (work_group_linear_id >= (batch * num_heads_q)) : (syclcompat::work_group_id::y() == 0);
 
     CUTLASS_PRAGMA_NO_UNROLL
     for (; tile_scheduler.is_valid(); ++tile_scheduler) {
@@ -256,8 +269,8 @@ public:
 
       auto blk_q_coord = get<1>(blk_coord); // seq_len_q_blk_idx
       auto blk_v_coord = get<0>(blk_coord); // head_size_blk_idx
-      auto batch_coord = get<2>(blk_coord); // batch_blk_idx
-      auto num_heads_coord = get<3>(blk_coord); // num_heads_blk_idx
+      auto batch_coord = use_linear_wg_id ? 0 : get<2>(blk_coord); // batch_blk_idx
+      auto num_heads_coord = use_linear_wg_id ? (work_group_linear_id % (batch * num_heads_q)) : get<3>(blk_coord); // num_heads_blk_idx
 
 #if ENABLE_DEBUG_PRINT
       if (syclcompat::local_id::x() == 0) {
@@ -353,10 +366,14 @@ public:
       }
 
       // firstly start prefetch work
-      if (syclcompat::work_group_id::y() == 1) {
+      // if (syclcompat::work_group_id::y() == COMPUTE_WG_ID) {
+      if (is_compute_wg) {
 #if ENABLE_DEBUG_PRINT
       if (syclcompat::work_group_id::z() == 0 && syclcompat::local_id::x() == 0) {
-        cute::print("\nWuxun debug>>> load work group %d, prefetch Q and K\n", syclcompat::work_group_id::y());
+      // if (work_group_linear_id == 10 && syclcompat::local_id::x() == 0) {
+        // cute::print("\nWuxun debug>>> load work group %d, prefetch Q and K\n", syclcompat::work_group_id::y());
+        cute::print("pQgQ(_, _, _, 0): ");cute::print(pQgQ(_, _, _, 0).shape());cute::print(pQgQ(_, _, _, 0).stride());cute::print("\n");
+        cute::print("pKgK(_, _, _, kv_tile_idx, 0): ");cute::print(pKgK(_, _, _, kv_tile_idx, 0).shape());cute::print(pKgK(_, _, _, kv_tile_idx, 0).stride());cute::print("\n");
       }
 #endif
         CUTLASS_PRAGMA_UNROLL
@@ -405,13 +422,22 @@ public:
       for(int split = 0; split < kv_splits - CausalMask; split++) {
         int curr_kv_tile_idx = is_KV_cache ? PagedKV ? kv_cache_tile_idx : split * ATOM_M + kv_tile_idx 
                                            : (split - kv_splits_cache) * ATOM_M + kv_tile_idx;
+        auto tSr = make_tensor<ElementAccumulator>(Shape<Int<Vec>, Int<FragsM>, Int<FragsN>>{});
+        clear(tSr);
 
-        if (syclcompat::work_group_id::y() == 1) {
+        if (is_compute_wg) {
+          // compute wg wait for prefetch wg to finish prefetching data
+          // while(((split + 1) % prefetch_step_limit == 0) && atomicLoad(params.load_ready_counter + work_group_id) == 0) {}
 #if ENABLE_DEBUG_PRINT
       if (syclcompat::work_group_id::z() == 0 && syclcompat::local_id::x() == 0) {
-        cute::print("\nWuxun debug>>> load work group %d, prefetch V split %d\n", syclcompat::work_group_id::y(), split);
+      // if (work_group_linear_id == 10 && syclcompat::local_id::x() == 0) {
+        // cute::print("\nWuxun debug>>> compute work group %d\n", syclcompat::work_group_id::y());
+        cute::print("pVgV(_, _, _, 0, curr_kv_tile_idx): ");cute::print(pVgV(_, _, _, 0, curr_kv_tile_idx).shape());cute::print(pVgV(_, _, _, 0, curr_kv_tile_idx).stride());cute::print("\n");
       }
 #endif
+          // Perform GEMM S = Q*K
+          collective_mma.mmaQK(tSr, gQ, gK(_, _, curr_kv_tile_idx / ATOM_M, _), tSr, ceil_div(head_size_qk, QK_BLK_K), mainloop_params, is_KV_cache, curr_kv_tile_idx % ATOM_M);
+
           // each sub-group gets a different base offset for prefetch to load it's own
           // required data for matrix V.
           CUTLASS_PRAGMA_UNROLL
@@ -420,25 +446,6 @@ public:
                         : prefetch(tiled_prefetch_v, pVgV(_, _, _, v, curr_kv_tile_idx));
           }
 
-          // make prefetch data ready for compute
-          // only one work item to store
-          if (syclcompat::local_id::x() == 0) {
-            atomicAdd(params.load_ready_counter + work_group_id, 1);
-          }
-        }
-
-        auto tSr = make_tensor<ElementAccumulator>(Shape<Int<Vec>, Int<FragsM>, Int<FragsN>>{});
-        clear(tSr);
-
-        if (syclcompat::work_group_id::y() == 0) {
-#if ENABLE_DEBUG_PRINT
-      if (syclcompat::work_group_id::z() == 0 && syclcompat::local_id::x() == 0) {
-        cute::print("\nWuxun debug>>> compute work group %d\n", syclcompat::work_group_id::y());
-      }
-#endif
-          // Perform GEMM S = Q*K
-          collective_mma.mmaQK(tSr, gQ, gK(_, _, curr_kv_tile_idx / ATOM_M, _), tSr, ceil_div(head_size_qk, QK_BLK_K), mainloop_params, is_KV_cache, curr_kv_tile_idx % ATOM_M);
-
           CollectiveSoftmaxEpilogue softmax(params.softmax);
           softmax.template operator()<Num_SGs>(split == 0, tSr, max_reg, sum_reg, shmem_max_tensor, out_reg);
 
@@ -446,25 +453,45 @@ public:
 
           // mark prefetch data is being consumed, ready for next prefetch
           // only one work item to store
-          if (syclcompat::local_id::x() == 0) {
+          if (syclcompat::local_id::x() == 0
+            && (
+              ((split + 1) % (prefetch_step_limit / 2) == 0) || (split == kv_splits - CausalMask - 1)
+            )
+            ) {
 #if ENABLE_DEBUG_PRINT
             if (syclcompat::work_group_id::z() == 0) {
               cute::print("Wuxun debug>>> wg %d reset load counter to 0, finished K/V split %d, ready for next prefetch\n", syclcompat::work_group_id::y(), split);
             }
 #endif
-            atomicSub(params.load_ready_counter + work_group_id, 1);
+            // atomicSub(params.load_ready_counter + COMPUTE_WG_ID, prefetch_step_limit);
+          }
+
+          // Prefetch the next Q tile
+          CUTLASS_PRAGMA_UNROLL
+          for (int i = 0; i < size<3>(pQgQ); i++) {
+            prefetch(tiled_prefetch_q, pQgQ(_, _, _, i));
+          }
+
+          bool is_next_KV_cache = split + 1 < kv_splits_cache;
+          int kv_cache_next_tile_idx = kv_cache_tile_idx;
+
+          is_KV_cache = is_next_KV_cache;
+          kv_cache_tile_idx = kv_cache_next_tile_idx;
+          CUTLASS_PRAGMA_UNROLL
+          for (int j = 0; j < size<4>(pKgK); j++) {
+            is_KV_cache ? prefetch(tiled_prefetch_k_cache, pKgK(_, _, _, PagedKV ? kv_cache_tile_idx : (split + 1) * ATOM_M + kv_tile_idx, j))
+                        : prefetch(tiled_prefetch_k, pKgK(_, _, _,(split - kv_splits_cache + 1) * ATOM_M + kv_tile_idx, j));
           }
         }
 
-        if (syclcompat::work_group_id::y() == 1) {
-          while (atomicLoad(params.load_ready_counter + work_group_id) == prefetch_step_limit
-            && prefetch_step_limit - atomicLoad(params.load_ready_counter + work_group_id) > 4) {}
+        if (is_load_wg) {
+          // while (((split % prefetch_step_limit == 0) && atomicLoad(params.load_ready_counter + LOAD_WG_ID) == prefetch_step_limit) {}
 #if ENABLE_DEBUG_PRINT
       if (syclcompat::work_group_id::z() == 0 && syclcompat::local_id::x() == 0) {
-        cute::print("\nWuxun debug>>> load work group %d, prefetch next Q and K split %d\n", syclcompat::work_group_id::y(), (split + 1));
+        // cute::print("\nWuxun debug>>> load work group %d, prefetch next Q and K split %d\n", syclcompat::work_group_id::y(), (split + prefetch_step_limit));
       }
 #endif
-          bool is_next_KV_cache = split + 1 < kv_splits_cache;
+          bool is_next_KV_cache = split + prefetch_step_limit < kv_splits_cache;
           int kv_cache_next_tile_idx = kv_cache_tile_idx;
 
           // Prefetch the next Q tile
@@ -480,8 +507,29 @@ public:
           // required data for matrix K.
           CUTLASS_PRAGMA_UNROLL
           for (int j = 0; j < size<4>(pKgK); j++) {
-            is_KV_cache ? prefetch(tiled_prefetch_k_cache, pKgK(_, _, _, PagedKV ? kv_cache_tile_idx : (split + 1) * ATOM_M + kv_tile_idx, j))
-                        : prefetch(tiled_prefetch_k, pKgK(_, _, _,(split - kv_splits_cache + 1) * ATOM_M + kv_tile_idx, j));
+            is_KV_cache ? prefetch(tiled_prefetch_k_cache, pKgK(_, _, _, PagedKV ? kv_cache_tile_idx : (split + prefetch_step_limit) * ATOM_M + kv_tile_idx, j))
+                        : prefetch(tiled_prefetch_k, pKgK(_, _, _,(split - kv_splits_cache + prefetch_step_limit) * ATOM_M + kv_tile_idx, j));
+          }
+
+          collective_mma.mmaQK(tSr, gQ, gK(_, _, curr_kv_tile_idx / ATOM_M, _), tSr, 1, mainloop_params, is_KV_cache, curr_kv_tile_idx % ATOM_M);
+
+          // each sub-group gets a different base offset for prefetch to load it's own
+          // required data for matrix V.
+          CUTLASS_PRAGMA_UNROLL
+          for(int v = 0; v < VSlicer; v++) {
+            is_KV_cache ? prefetch(tiled_prefetch_v_cache, pVgV(_, _, _, v, PagedKV ? kv_cache_tile_idx : (split + prefetch_step_limit) * ATOM_M + kv_tile_idx))
+                        : prefetch(tiled_prefetch_v, pVgV(_, _, _, v, (split - kv_splits_cache + prefetch_step_limit) * ATOM_M + kv_tile_idx));
+          }
+
+          CollectiveSoftmaxEpilogue softmax(params.softmax);
+          softmax.template operator()<Num_SGs>(split == 0, tSr, max_reg, sum_reg, shmem_max_tensor, out_reg);
+
+          collective_mma.template mmaPV<1>(out_reg, tSr, gV, out_reg, mainloop_params, is_KV_cache, curr_kv_tile_idx);
+
+          // make prefetch data ready for compute
+          // only one work item to store
+          if (syclcompat::local_id::x() == 0 && (split + 1) % (prefetch_step_limit) == 0) {
+            atomicAdd(params.load_ready_counter + LOAD_WG_ID, prefetch_step_limit);
           }
         }
 
@@ -566,7 +614,8 @@ public:
 
       // epilogue(params.problem_shape, sequence_length_shape, blk_coord_mnkl, shmem_out_tensor, sum_reg, shmem_sum_tensor);
 
-      if (syclcompat::work_group_id::y() == 0) {
+      // if (syclcompat::work_group_id::y() == COMPUTE_WG_ID) {
+      if (is_compute_wg) {
         Tensor shmem_out_tensor = make_tensor(make_smem_ptr(smem), make_shape(Int<(size(AccumShape{})) * SubgroupSize * Num_SGs>{}));
         // write output to SLM
         int idx = (thread_idx % SubgroupSize) + (sub_group_id * out_reg.size() * SubgroupSize);
