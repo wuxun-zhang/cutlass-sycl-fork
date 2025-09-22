@@ -115,6 +115,17 @@ struct XeFlashDecodeIndividualTileScheduler {
     dim3 grid(size(ceil_div(shape<7>(problem_size), shape<1>(tile_shape))),
               size(ceil_div(shape<3>(problem_size), 8)), // we want to process only 8 tokens per workgroup
               size(shape<0>(problem_size) * shape<1>(problem_size)));
+
+    // if total work group number is much smaller (less than hald of total SMs),
+    // we try to allocate more work groups to help loading data from global
+    // memory/L2 cache to improve bandwidth utlization.
+    int multiplier = 3;
+    if (grid.x * grid.y * grid.x <= hw_info.sm_count) {
+      if (grid.y == 1) {
+        grid.y *= (multiplier + 1);
+      }
+    }
+    printf("Wuxun debug>> sm count %d, grid [%d, %d, %d]\n", hw_info.sm_count, grid.x, grid.y, grid.z);
     return Params{ grid, {shape<1>(problem_size)} };
   }
 
