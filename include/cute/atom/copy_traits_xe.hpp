@@ -415,6 +415,13 @@ struct XE_2D_LD_Unpack {
                            (atom.width * sizeof_bits_v<dtype>) / sizeof_bits_v<int8_t>, atom.height,
                            (atom.pitch * sizeof_bits_v<dtype>) / sizeof_bits_v<int8_t>,
                            intel::coord_t{(int)(x * sizeof_bits_v<dtype> / inst_size_bits), y});
+
+    // dtype* dst_ptr = (dtype*)base_addr + static_cast<size_t>(l) * atom.stride_l * sizeof_bits_v<dtype> / 16;
+    // CopyOp::copy(((uint8_t*)base_addr) + static_cast<size_t>(l) * atom.stride_l * sizeof_bits_v<dtype> / 8,
+    //              (atom.width * sizeof_bits_v<dtype>) / sizeof_bits_v<int8_t>, atom.height,
+    //              (atom.pitch * sizeof_bits_v<dtype>) / sizeof_bits_v<int8_t>,
+    //              intel::coord_t{(int)(x * sizeof_bits_v<dtype> / inst_size_bits), y},
+    //              dst_ptr);
   }
 
   template <class... TensorArgs>

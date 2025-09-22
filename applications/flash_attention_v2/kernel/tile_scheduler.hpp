@@ -120,7 +120,7 @@ struct XeFlashDecodeIndividualTileScheduler {
     // memory/L2 cache to improve bandwidth utlization.
     if (grid.x * grid.y * grid.x <= hw_info.sm_count) {
       if (grid.y == 1) {
-        grid.y *= 2;
+        grid.y *= 4;
       }
     }
     printf("Wuxun debug>> sm count %d, grid [%d, %d, %d]\n", hw_info.sm_count, grid.x, grid.y, grid.z);
