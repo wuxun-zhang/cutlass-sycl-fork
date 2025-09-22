@@ -422,6 +422,8 @@ struct XE_2D_LD_Unpack {
     //              (atom.pitch * sizeof_bits_v<dtype>) / sizeof_bits_v<int8_t>,
     //              intel::coord_t{(int)(x * sizeof_bits_v<dtype> / inst_size_bits), y},
     //              dst_ptr);
+    // volatile dtype tmp = dst_ptr[0];
+    // (void)tmp;
   }
 
   template <class... TensorArgs>

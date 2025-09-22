@@ -118,9 +118,10 @@ struct XeFlashDecodeIndividualTileScheduler {
     // if total work group number is much smaller (less than hald of total SMs),
     // we try to allocate more work groups to help loading data from global
     // memory/L2 cache to improve bandwidth utlization.
+    int multiplier = 3;
     if (grid.x * grid.y * grid.x <= hw_info.sm_count) {
       if (grid.y == 1) {
-        grid.y *= 4;
+        grid.y *= (multiplier + 1);
       }
     }
     printf("Wuxun debug>> sm count %d, grid [%d, %d, %d]\n", hw_info.sm_count, grid.x, grid.y, grid.z);
