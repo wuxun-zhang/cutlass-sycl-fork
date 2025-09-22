@@ -263,9 +263,9 @@ public:
     const int LOAD_WG_HEAD_ID = use_linear_wg_id ? (work_group_linear_id / multiplier) : work_group_id;
     // const int LOAD_WG_ID = use_linear_wg_id ? (work_group_linear_id % (batch * num_heads_q)) : work_group_id;
     // const int COMPUTE_WG_ID = use_linear_wg_id ? (work_group_linear_id % (batch * num_heads_q)) : work_group_id;
-    // const bool is_load_wg = use_linear_wg_id ? (work_group_linear_id < (multiplier * batch * num_heads_q)) : (syclcompat::work_group_id::y() == 1);
-    const bool is_load_wg = false;
-    const bool is_compute_wg = use_linear_wg_id ? (work_group_linear_id >= (multiplier * batch * num_heads_q)) : (syclcompat::work_group_id::y() == 0);
+    const bool is_load_wg = use_linear_wg_id ? (work_group_linear_id < (multiplier * batch * num_heads_q)) : (syclcompat::work_group_id::y() < multiplier);
+    // const bool is_load_wg = false;
+    const bool is_compute_wg = use_linear_wg_id ? (work_group_linear_id >= (multiplier * batch * num_heads_q)) : (syclcompat::work_group_id::y() == multiplier);
 
     CUTLASS_PRAGMA_NO_UNROLL
     for (; tile_scheduler.is_valid(); ++tile_scheduler) {
@@ -537,7 +537,8 @@ public:
         // loop for each load wg to prefetch all KV splits
         CUTLASS_PRAGMA_UNROLL
         for (int cnt = 0; cnt < num_splits_per_load_wg; cnt++) {
-          int split = (work_group_linear_id % multiplier) + cnt * multiplier;
+          int split_offset = use_linear_wg_id ? (work_group_linear_id % multiplier) : (syclcompat::work_group_id::y());
+          int split = split_offset + cnt * multiplier;
           if (split >= kv_splits - CausalMask) break;
 
           int curr_kv_tile_idx = is_KV_cache ? PagedKV ? kv_cache_tile_idx : split * ATOM_M + kv_tile_idx 
