@@ -124,21 +124,31 @@ public:
     auto group = compat::get_nd_item<1>().get_group();
     const int sg_group_id = sg.get_group_id()[0];
     const int sg_local_id = sg.get_local_id()[0];
+    static constexpr int barrier_scope = 2;
 
+      // broadcast curr_max to all threads in the subgroup
+      // from tid 0 to all other threads in the subgroup
       auto curr_max = group_broadcast(sg, max_val, 0);
+      // each thread handles its own fragment
+      // find max value in the fragment
       CUTLASS_PRAGMA_UNROLL
       for (int z = 0; z < FragsN; z++) {
         curr_max = sycl::max(curr_max, src(z));
         src(z) *= params.scale;
       }
 
+      // reduce max across subgroup
       curr_max = reduce_over_group(sg, curr_max, sycl::maximum<>());
 
+      // store subgroup max value to shared memory
       if(sg_local_id == 0) {
         stensor_max(sg_group_id) = curr_max;
       }
 
+    // all subgroups arrive here
     sycl::group_barrier(group);
+
+    // reduce max across all subgroups in work group
     if(sg_local_id == 0) {
       CUTLASS_PRAGMA_UNROLL
       for (int i = 0; i < Num_SGs; i++) {
@@ -157,9 +167,9 @@ public:
     constexpr int FragsM = get<1>(FragAccLayout{}.shape());
     constexpr int FragsNS = get<2>(FragAccLayout{}.shape());
     constexpr int FragsNOut = size(select<2,3>(FragOutLayout{}.shape()));
+    // global max value
     Element max_prev = max_val;
     static_assert(Vec * FragsM == 1, "No. of attention rows per subgroup should not exceed 1 MMA Atom worth of rows.");
-
     reduce_max<Num_SGs,FragsNS>(frag_s, shmem_tensor_max, max_val);
 
     if (!is_first) {

@@ -168,6 +168,10 @@ public:
     SoftmaxParams softmax;
     EpilogueParams epilogue;
     TileSchedulerParams scheduler;
+    // workspace size for storing partial results of different KV splits
+    ElementAccumulator *partial_attn_results = nullptr;
+    // for atomic add
+    int32_t *atomic_reduce_cnt = nullptr;
   };
 
   //
@@ -176,12 +180,15 @@ public:
 
   // Convert to underlying arguments. In this case, a simple copy for the aliased type.
   static Params to_underlying_arguments(Arguments const &args, void *workspace) {
-    (void)workspace;
+    auto sm_count = args.hw_info.sm_count;
+    int32_t* atomic_reduce_cnt = reinterpret_cast<int32_t*>(workspace);
+    ElementAccumulator* partial_attn_results = reinterpret_cast<ElementAccumulator*>(reinterpret_cast<int8_t*>(workspace) + sm_count * sizeof(int32_t));
     return {args.mode, args.problem_shape,
             CollectiveMainloop::to_underlying_arguments(args.problem_shape, args.mainloop, workspace),
             CollectiveSoftmaxEpilogue::to_underlying_arguments(args.softmax),
             CollectiveEpilogue::to_underlying_arguments(args.problem_shape, args.epilogue, workspace),
-            TileScheduler::to_underlying_arguments(args.problem_shape, args.hw_info, TileShapeOutput{})};
+            TileScheduler::to_underlying_arguments(args.problem_shape, args.hw_info, TileShapeOutput{}),
+          partial_attn_results, atomic_reduce_cnt};
   }
 
   static bool can_implement(Arguments const &args) {
@@ -191,10 +198,22 @@ public:
     return mode_implementable && valid_page_size;
   }
 
-  static int get_workspace_size(Arguments const &args) { return 0; }
+  static int get_workspace_size(Arguments const &args) {
+    // FIXME: support up to sm_count heads
+    auto sm_count = args.hw_info.sm_count;
+    // currenly assuming 2 wgs (1 load and 1 compute) to compute half KV splits separately
+    int ws_size = sm_count * 2 * (Int<size(AccumShape{}) + 1>{} * Num_SGs * SubgroupSize) * sizeof(ElementAccumulator)
+      + sm_count * sizeof(int32_t);
+    return ws_size;
+  }
 
   static cutlass::Status initialize_workspace(Arguments const &args, void *workspace = nullptr,
                                               cudaStream_t stream = nullptr, CudaHostAdapter *cuda_adapter = nullptr) {
+    auto sm_count = args.hw_info.sm_count;
+    compat::fill(reinterpret_cast<int32_t*>(workspace), (int32_t)0, sm_count);
+    auto partial_ws_count = (get_workspace_size(args) - sm_count * sizeof(int32_t)) / sizeof(ElementAccumulator);
+    auto* partial_attn_results = reinterpret_cast<ElementAccumulator*>(reinterpret_cast<int8_t*>(workspace) + sm_count * sizeof(int32_t));
+    compat::fill(partial_attn_results, (ElementAccumulator)0, partial_ws_count);
     return Status::kSuccess;
   }
 
@@ -237,6 +256,7 @@ public:
 
     int thread_idx = int(ThreadIdxX());
     int sub_group_id = thread_idx / SubgroupSize;
+    int tid_in_sg = thread_idx % SubgroupSize;
 
     TileScheduler tile_scheduler{params.scheduler};
 
@@ -247,15 +267,22 @@ public:
     // sync point between prefetch wg and compute wg. Prefetch wg will increment
     // its own atomic counter till prefetch_step_limit, then wait for compute wg to
     // decrement it to less than prefetch_step_limit.
-    const int multiplier = 3; // use more load wgs to improve memory bandwidth
+    const int multiplier = 1; // use more load wgs to improve memory bandwidth
     const int prefetch_step_limit = 1;
     const bool use_linear_wg_id = true;
-    const int LOAD_WG_HEAD_ID = use_linear_wg_id ? (work_group_linear_id / multiplier) : work_group_id;
-    // const int LOAD_WG_ID = use_linear_wg_id ? (work_group_linear_id % (batch * num_heads_q)) : work_group_id;
-    // const int COMPUTE_WG_ID = use_linear_wg_id ? (work_group_linear_id % (batch * num_heads_q)) : work_group_id;
-    const bool is_load_wg = use_linear_wg_id ? (work_group_linear_id < (multiplier * batch * num_heads_q)) : (compat::work_group_id::y() < multiplier);
+    // another way to allow load wg prefetch different KV splits from different heads multiple times
+    const bool use_load_wg_multi_heads = false;
+    const int num_batch_heads = batch * num_heads_q;
+    const int LOAD_WG_HEAD_ID = use_linear_wg_id ? (use_load_wg_multi_heads ? (work_group_linear_id / multiplier) : (work_group_linear_id % num_batch_heads)) : work_group_id;
+    const int COMPUTE_WG_HEAD_ID = use_linear_wg_id ? (work_group_linear_id % num_batch_heads) : work_group_id;
+    const bool is_load_wg = use_linear_wg_id ? (work_group_linear_id < (multiplier * num_batch_heads)) : (compat::work_group_id::y() < multiplier);
     // const bool is_load_wg = false;
-    const bool is_compute_wg = use_linear_wg_id ? (work_group_linear_id >= (multiplier * batch * num_heads_q)) : (compat::work_group_id::y() == multiplier);
+    const bool is_compute_wg = use_linear_wg_id ? (work_group_linear_id >= (multiplier * num_batch_heads)) : (compat::work_group_id::y() == multiplier);
+
+    // work group ID for each head
+    const int HEAD_WG_ID = is_load_wg ? LOAD_WG_HEAD_ID : COMPUTE_WG_HEAD_ID;
+
+    constexpr int barrier_scope = 2; // work-group;
 
     CUTLASS_PRAGMA_NO_UNROLL
     for (; tile_scheduler.is_valid(); ++tile_scheduler) {
@@ -266,7 +293,7 @@ public:
       // auto batch_coord = get<2>(blk_coord); // batch_blk_idx
       auto batch_coord = use_linear_wg_id ? 0 : get<2>(blk_coord); // batch_blk_idx
       // auto num_heads_coord = get<3>(blk_coord); // num_heads_blk_idx
-      auto num_heads_coord = use_linear_wg_id ? (is_load_wg ? LOAD_WG_HEAD_ID : (work_group_linear_id % (batch * num_heads_q))) : get<3>(blk_coord); // num_heads_blk_idx
+      auto num_heads_coord = use_linear_wg_id ? HEAD_WG_ID : get<3>(blk_coord); // num_heads_blk_idx
 
       // For variable sequence length case, batch is considered to be 1 (same as group gemm).
       // For fixed sequence length case, the l_coord is the weighted sum of both batch_coord and num_heads_coord.
@@ -308,6 +335,8 @@ public:
       // calculate how many splits each load wg needs to handle
       const int num_splits_per_load_wg = ceil_div(kv_splits-1, multiplier);
       // const int num_splits_per_load_wg = 6;
+      // load wg and compute wg handle half of total kv splits
+      const int kv_split_start_offset_compute_wg = (kv_splits - 1) / 2;
 
       auto mainloop_params = CollectiveMainloop::get_updated_copies(params.mainloop, params.problem_shape, sequence_length_shape, batch_coord);
       // For Decode, QK_BLK_M is set to 1 MMA Atom worth of data (in our case 8), this is because seq_len_qo == 1.
@@ -382,7 +411,7 @@ public:
 
       if (is_compute_wg) {
         CUTLASS_PRAGMA_UNROLL
-        for(int split = 0; split < kv_splits - 1; split++) {
+        for(int split = kv_split_start_offset_compute_wg; split < kv_splits - 1; split++) {
           int curr_kv_tile_idx = is_KV_cache ? PagedKV ? kv_cache_tile_idx : split * ATOM_M + kv_tile_idx 
                                             : (split - kv_splits_cache) * ATOM_M + kv_tile_idx;
 
@@ -394,11 +423,11 @@ public:
 
           // each sub-group gets a different base offset for prefetch to load it's own
           // required data for matrix V.
-          // CUTLASS_PRAGMA_UNROLL
-          // for(int v = 0; v < VSlicer; v++) {
-          //   is_KV_cache ? prefetch(tiled_prefetch_v_cache, pVgV(_, _, _, v, curr_kv_tile_idx))
-          //               : prefetch(tiled_prefetch_v, pVgV(_, _, _, v, curr_kv_tile_idx));
-          // }
+          CUTLASS_PRAGMA_UNROLL
+          for(int v = 0; v < VSlicer; v++) {
+            is_KV_cache ? prefetch(tiled_prefetch_v_cache, pVgV(_, _, _, v, curr_kv_tile_idx))
+                        : prefetch(tiled_prefetch_v, pVgV(_, _, _, v, curr_kv_tile_idx));
+          }
 
           bool is_next_KV_cache = split + 1 < kv_splits_cache;
           int kv_cache_next_tile_idx = kv_cache_tile_idx;
@@ -423,41 +452,10 @@ public:
           }
 
           CollectiveSoftmaxEpilogue softmax(params.softmax);
+          // group barrier happens here
           softmax.template operator()<Num_SGs>(split == 0, tSr, max_reg, sum_reg, shmem_max_tensor, out_reg);
 
           collective_mma.template mmaPV<VSlicer>(out_reg, tSr, gV, out_reg, mainloop_params, is_KV_cache, curr_kv_tile_idx);
-
-          // Prefetch the next Q tile
-          // CUTLASS_PRAGMA_UNROLL
-          // for (int i = 0; i < size<3>(pQgQ); i++) {
-          //   prefetch(tiled_prefetch_q, pQgQ(_, _, _, i));
-          // }
-
-          is_KV_cache = is_next_KV_cache;
-          kv_cache_tile_idx = kv_cache_next_tile_idx;
-          // The headsize for both cached and non-cached version is the same.
-          // each sub-group gets a different base offset for prefetch to load it's own
-          // required data for matrix K.
-          // CUTLASS_PRAGMA_UNROLL
-          // for (int j = 0; j < size<4>(pKgK); j++) {
-          //   is_KV_cache ? prefetch(tiled_prefetch_k_cache, pKgK(_, _, _, PagedKV ? kv_cache_tile_idx : (split + 1) * ATOM_M + kv_tile_idx, j))
-          //               : prefetch(tiled_prefetch_k, pKgK(_, _, _,(split - kv_splits_cache + 1) * ATOM_M + kv_tile_idx, j));
-          // }
-        }
-      } // if (is_compute_wg)
-      else { // is_load_wg
-        // loop for each load wg to prefetch all KV splits
-        CUTLASS_PRAGMA_UNROLL
-        for (int cnt = 0; cnt < num_splits_per_load_wg; cnt++) {
-          int split_offset = use_linear_wg_id ? (work_group_linear_id % multiplier) : (compat::work_group_id::y());
-          int split = split_offset + cnt * multiplier;
-          if (split >= kv_splits - 1) break;
-
-          int curr_kv_tile_idx = is_KV_cache ? PagedKV ? kv_cache_tile_idx : split * ATOM_M + kv_tile_idx 
-                                            : (split - kv_splits_cache) * ATOM_M + kv_tile_idx;
-          
-          bool is_next_KV_cache = split < kv_splits_cache;
-          int kv_cache_next_tile_idx = kv_cache_tile_idx;
 
           // Prefetch the next Q tile
           CUTLASS_PRAGMA_UNROLL
@@ -472,24 +470,152 @@ public:
           // required data for matrix K.
           CUTLASS_PRAGMA_UNROLL
           for (int j = 0; j < size<4>(pKgK); j++) {
-            is_KV_cache ? prefetch(tiled_prefetch_k_cache, pKgK(_, _, _, curr_kv_tile_idx, j))
-                        : prefetch(tiled_prefetch_k, pKgK(_, _, _,(split - kv_splits_cache) * ATOM_M + kv_tile_idx, j));
+            is_KV_cache ? prefetch(tiled_prefetch_k_cache, pKgK(_, _, _, PagedKV ? kv_cache_tile_idx : (split + 1) * ATOM_M + kv_tile_idx, j))
+                        : prefetch(tiled_prefetch_k, pKgK(_, _, _,(split - kv_splits_cache + 1) * ATOM_M + kv_tile_idx, j));
           }
+        }
 
-          // collective_mma.mmaQK(tSr, gQ, gK(_, _, curr_kv_tile_idx / ATOM_M, _), tSr, 1, mainloop_params, is_KV_cache, curr_kv_tile_idx % ATOM_M);
+        // After finshing iterating partial kv splits, copy partial results
+        // (out_reg) to global memory for later reduce across load wg and compute wg
+        int offset = HEAD_WG_ID * size(AccumShape{}) * Num_SGs * SubgroupSize
+                                          + sub_group_id * SubgroupSize * size(AccumShape{})
+                                          + tid_in_sg * size(AccumShape{});
+        Tensor tPartial = make_tensor(params.partial_attn_results + offset, make_shape(AccumShape{}));
+        // copy compute wg partial results to second half of workspace
+        copy(out_reg, tPartial);
 
-          // sum_reg = sycl::native::exp2(sum_reg);
+        if (compat::local_id::x() == 0) {
+          atomicAdd(params.atomic_reduce_cnt + HEAD_WG_ID, 1);
+        }
+      } // if (is_compute_wg)
+      else { // is_load_wg
+        // load wg also to do softmax calculations, skip prefetch
+        CUTLASS_PRAGMA_UNROLL
+        for(int split = 0; split < kv_split_start_offset_compute_wg; split++) {
+          int curr_kv_tile_idx = is_KV_cache ? PagedKV ? kv_cache_tile_idx : split * ATOM_M + kv_tile_idx 
+                                            : (split - kv_splits_cache) * ATOM_M + kv_tile_idx;
+
+          auto tSr = make_tensor<ElementAccumulator>(Shape<Int<Vec>, Int<FragsM>, Int<FragsN>>{});
+          clear(tSr);
+
+          // Perform GEMM S = Q*K
+          collective_mma.mmaQK(tSr, gQ, gK(_, _, curr_kv_tile_idx / ATOM_M, _), tSr, ceil_div(head_size_qk, QK_BLK_K), mainloop_params, is_KV_cache, curr_kv_tile_idx % ATOM_M);
 
           // each sub-group gets a different base offset for prefetch to load it's own
           // required data for matrix V.
           CUTLASS_PRAGMA_UNROLL
           for(int v = 0; v < VSlicer; v++) {
             is_KV_cache ? prefetch(tiled_prefetch_v_cache, pVgV(_, _, _, v, curr_kv_tile_idx))
-                        : prefetch(tiled_prefetch_v, pVgV(_, _, _, v, (split - kv_splits_cache) * ATOM_M + kv_tile_idx));
+                        : prefetch(tiled_prefetch_v, pVgV(_, _, _, v, curr_kv_tile_idx));
           }
 
-          // sum_reg = sycl::native::exp2(sum_reg);
+          bool is_next_KV_cache = split + 1 < kv_splits_cache;
+          int kv_cache_next_tile_idx = kv_cache_tile_idx;
+          if constexpr (PagedKV) {
+            if (is_next_KV_cache) {
+              int curr_batch_pages = is_var_len ? mainloop_params.num_pages_per_seq[batch_coord + 1] - mainloop_params.num_pages_per_seq[batch_coord]
+                                                : ceil_div(seq_len_kv_cache, mainloop_params.page_size);
+              int curr_page_logical_idx = ((split + 1) * QK_BLK_N + kv_tile_idx * QK_SG_N) / mainloop_params.page_size;
+              int batch_offset = is_var_len ? mainloop_params.num_pages_per_seq[batch_coord] : batch_coord * curr_batch_pages;
+              bool valid_page = curr_page_logical_idx < curr_batch_pages;
+              // get physical page idx from page table
+              if (valid_page) {
+                kv_cache_next_tile_idx = mainloop_params.ptr_page_table[
+                          batch_offset +                      // page table for this batch
+                          curr_page_logical_idx               // tile idx to logical page idx
+                      ] * tiles_per_page +                // base block idx of physical page
+                      kv_tile_idx % tiles_per_page;     // offset within page
+              } else {
+                kv_cache_next_tile_idx = curr_batch_pages * tiles_per_page; // push idx out of bounds to respect the boundary between batches
+              }
+            }
+          }
 
+          CollectiveSoftmaxEpilogue softmax(params.softmax);
+          // group barrier happens here
+          softmax.template operator()<Num_SGs>(split == 0, tSr, max_reg, sum_reg, shmem_max_tensor, out_reg);
+
+          collective_mma.template mmaPV<VSlicer>(out_reg, tSr, gV, out_reg, mainloop_params, is_KV_cache, curr_kv_tile_idx);
+
+          // Prefetch the next Q tile
+          CUTLASS_PRAGMA_UNROLL
+          for (int i = 0; i < size<3>(pQgQ); i++) {
+            prefetch(tiled_prefetch_q, pQgQ(_, _, _, i));
+          }
+
+          is_KV_cache = is_next_KV_cache;
+          kv_cache_tile_idx = kv_cache_next_tile_idx;
+          // The headsize for both cached and non-cached version is the same.
+          // each sub-group gets a different base offset for prefetch to load it's own
+          // required data for matrix K.
+          CUTLASS_PRAGMA_UNROLL
+          for (int j = 0; j < size<4>(pKgK); j++) {
+            is_KV_cache ? prefetch(tiled_prefetch_k_cache, pKgK(_, _, _, PagedKV ? kv_cache_tile_idx : (split + 1) * ATOM_M + kv_tile_idx, j))
+                        : prefetch(tiled_prefetch_k, pKgK(_, _, _,(split - kv_splits_cache + 1) * ATOM_M + kv_tile_idx, j));
+          }
+        }
+
+        // After finshing iterating partial kv splits, copy partial results
+        // (out_reg) to global memory for later reduce across load wg and compute wg
+        int offset = /*second half workspace offset*/num_batch_heads * size(AccumShape{}) * Num_SGs * SubgroupSize
+            + HEAD_WG_ID * size(AccumShape{}) * Num_SGs * SubgroupSize
+                                          + sub_group_id * SubgroupSize * size(AccumShape{})
+                                          + tid_in_sg * size(AccumShape{});
+        Tensor tPartial = make_tensor(params.partial_attn_results + offset, make_shape(AccumShape{}));
+        // copy compute wg partial results to second half of workspace
+        copy(out_reg, tPartial);
+
+        if (compat::local_id::x() == 0) {
+          atomicAdd(params.atomic_reduce_cnt + HEAD_WG_ID, 1);
+        }
+
+        // loop for each load wg to prefetch all KV splits
+        CUTLASS_PRAGMA_UNROLL
+        for (int cnt = 0; cnt < num_splits_per_load_wg; cnt++) {
+          // // split barrier - make threads loosely together
+          // // barrier_arrive(barrier_scope);
+          // int split_offset = use_linear_wg_id ? (work_group_linear_id % multiplier) : (compat::work_group_id::y());
+          // int split = split_offset + cnt * multiplier;
+          // if (split >= kv_splits - 1) {
+          //   // barrier_wait(barrier_scope);
+          //   break;
+          // }
+
+          // int curr_kv_tile_idx = is_KV_cache ? PagedKV ? kv_cache_tile_idx : split * ATOM_M + kv_tile_idx 
+          //                                   : (split - kv_splits_cache) * ATOM_M + kv_tile_idx;
+          
+          // bool is_next_KV_cache = split < kv_splits_cache;
+          // int kv_cache_next_tile_idx = kv_cache_tile_idx;
+
+          // // Prefetch the next Q tile
+          // CUTLASS_PRAGMA_UNROLL
+          // for (int i = 0; i < size<3>(pQgQ); i++) {
+          //   prefetch(tiled_prefetch_q, pQgQ(_, _, _, i));
+          // }
+
+          // is_KV_cache = is_next_KV_cache;
+          // kv_cache_tile_idx = kv_cache_next_tile_idx;
+          // // The headsize for both cached and non-cached version is the same.
+          // // each sub-group gets a different base offset for prefetch to load it's own
+          // // required data for matrix K.
+          // CUTLASS_PRAGMA_UNROLL
+          // for (int j = 0; j < size<4>(pKgK); j++) {
+          //   is_KV_cache ? prefetch(tiled_prefetch_k_cache, pKgK(_, _, _, curr_kv_tile_idx, j))
+          //               : prefetch(tiled_prefetch_k, pKgK(_, _, _,(split - kv_splits_cache) * ATOM_M + kv_tile_idx, j));
+          // }
+
+          // // collective_mma.mmaQK(tSr, gQ, gK(_, _, curr_kv_tile_idx / ATOM_M, _), tSr, 1, mainloop_params, is_KV_cache, curr_kv_tile_idx % ATOM_M);
+
+          // // each sub-group gets a different base offset for prefetch to load it's own
+          // // required data for matrix V.
+          // CUTLASS_PRAGMA_UNROLL
+          // for(int v = 0; v < VSlicer; v++) {
+          //   is_KV_cache ? prefetch(tiled_prefetch_v_cache, pVgV(_, _, _, v, curr_kv_tile_idx))
+          //               : prefetch(tiled_prefetch_v, pVgV(_, _, _, v, (split - kv_splits_cache) * ATOM_M + kv_tile_idx));
+          // }
+
+          // another half of split barrier
+          // barrier_wait(barrier_scope);
           // CollectiveSoftmaxEpilogue softmax(params.softmax);
           // softmax.template operator()<Num_SGs>(split == 0, tSr, max_reg, sum_reg, shmem_max_tensor, out_reg);
 
@@ -500,6 +626,45 @@ public:
           // if (compat::local_id::x() == 0 && (split + 1) % (prefetch_step_limit) == 0) {
           //   atomicAdd(params.load_ready_counter + LOAD_WG_ID, prefetch_step_limit);
           // }
+        }
+      }
+
+      // need sync compute wg and load wg here to accumulate final results
+      // FIXME wuxun: add log-sum-exp for accurate results
+      // atomic add needed here
+      if (is_compute_wg) {
+        // only compute wg participate into final reduce
+
+        // check atomic
+        while(atomicLoad(params.atomic_reduce_cnt + HEAD_WG_ID) != 2) {}
+        // reset atomic due to workspace will be used across iterations
+        if (compat::local_id::x() == 0) {
+          atomicSub(params.atomic_reduce_cnt + HEAD_WG_ID, 2);
+        }
+        clear(out_reg);
+
+        // calculate offset for partial results
+        int first_offset = HEAD_WG_ID * size(AccumShape{}) * Num_SGs * SubgroupSize
+                                          + sub_group_id * SubgroupSize * size(AccumShape{})
+                                          + tid_in_sg * size(AccumShape{});
+        int second_offset = num_batch_heads * size(AccumShape{}) * Num_SGs * SubgroupSize
+                                          + HEAD_WG_ID * size(AccumShape{}) * Num_SGs * SubgroupSize
+                                          + sub_group_id * SubgroupSize * size(AccumShape{})
+                                          + tid_in_sg * size(AccumShape{});
+        auto partial_attn_result1 = make_tensor(params.partial_attn_results + first_offset, make_shape(AccumShape{}));
+        auto partial_attn_result2 = make_tensor(params.partial_attn_results + second_offset, make_shape(AccumShape{}));
+
+        Tensor out_reg_2 = make_tensor<ElementAccumulator>(AccumShape{});
+        clear(out_reg_2);
+
+        // load partial results from global memory to register
+        copy(partial_attn_result1, out_reg);
+        copy(partial_attn_result2, out_reg_2);
+
+        // final reduce and store into out_reg
+        CUTLASS_PRAGMA_UNROLL
+        for (int i = 0; i < size(AccumShape{}); i++) {
+          out_reg(i) = out_reg(i) + out_reg_2(i);
         }
       }
 
