@@ -168,7 +168,7 @@ public:
     SoftmaxParams softmax;
     EpilogueParams epilogue;
     TileSchedulerParams scheduler;
-    // workspace size for storing partial results of different KV splits
+    // workspace for storing partial results of different KV splits
     ElementAccumulator *partial_attn_results = nullptr;
     // for atomic add
     int32_t *atomic_reduce_cnt = nullptr;
@@ -269,15 +269,15 @@ public:
     // decrement it to less than prefetch_step_limit.
     const int multiplier = 1; // use more load wgs to improve memory bandwidth
     const int prefetch_step_limit = 1;
-    const bool use_linear_wg_id = true;
+    const bool use_linear_wg_id = false;
     // another way to allow load wg prefetch different KV splits from different heads multiple times
     const bool use_load_wg_multi_heads = false;
     const int num_batch_heads = batch * num_heads_q;
     const int LOAD_WG_HEAD_ID = use_linear_wg_id ? (use_load_wg_multi_heads ? (work_group_linear_id / multiplier) : (work_group_linear_id % num_batch_heads)) : work_group_id;
     const int COMPUTE_WG_HEAD_ID = use_linear_wg_id ? (work_group_linear_id % num_batch_heads) : work_group_id;
-    const bool is_load_wg = use_linear_wg_id ? (work_group_linear_id < (multiplier * num_batch_heads)) : (compat::work_group_id::y() < multiplier);
-    // const bool is_load_wg = false;
-    const bool is_compute_wg = use_linear_wg_id ? (work_group_linear_id >= (multiplier * num_batch_heads)) : (compat::work_group_id::y() == multiplier);
+    // const bool is_load_wg = use_linear_wg_id ? (work_group_linear_id < (multiplier * num_batch_heads)) : (compat::work_group_id::y() < multiplier);
+    const bool is_load_wg = false;
+    const bool is_compute_wg = use_linear_wg_id ? (work_group_linear_id >= (multiplier * num_batch_heads)) : (compat::work_group_id::y() == 0);
 
     // work group ID for each head
     const int HEAD_WG_ID = is_load_wg ? LOAD_WG_HEAD_ID : COMPUTE_WG_HEAD_ID;
@@ -336,7 +336,8 @@ public:
       const int num_splits_per_load_wg = ceil_div(kv_splits-1, multiplier);
       // const int num_splits_per_load_wg = 6;
       // load wg and compute wg handle half of total kv splits
-      const int kv_split_start_offset_compute_wg = (kv_splits - 1) / 2;
+      // const int kv_split_start_offset_compute_wg = (kv_splits - 1) / 2;
+      const int kv_split_start_offset_compute_wg = 0;
 
       auto mainloop_params = CollectiveMainloop::get_updated_copies(params.mainloop, params.problem_shape, sequence_length_shape, batch_coord);
       // For Decode, QK_BLK_M is set to 1 MMA Atom worth of data (in our case 8), this is because seq_len_qo == 1.
@@ -408,6 +409,11 @@ public:
       Tensor shmem_max_tensor = make_tensor(make_smem_ptr(smem), make_shape(Int<Num_SGs * FragsM>{}));
 
       bool is_KV_cache = seq_len_kv_cache != 0;
+
+      if (compat::local_id::x() == 0) {
+        // reset atomic counter before computation
+        *(params.atomic_reduce_cnt + HEAD_WG_ID) = 0;
+      }
 
       if (is_compute_wg) {
         CUTLASS_PRAGMA_UNROLL
@@ -488,7 +494,7 @@ public:
           atomicAdd(params.atomic_reduce_cnt + HEAD_WG_ID, 1);
         }
       } // if (is_compute_wg)
-      else { // is_load_wg
+      else if (is_load_wg) {
         // load wg also to do softmax calculations, skip prefetch
         CUTLASS_PRAGMA_UNROLL
         for(int split = 0; split < kv_split_start_offset_compute_wg; split++) {
@@ -629,18 +635,17 @@ public:
         }
       }
 
-      // need sync compute wg and load wg here to accumulate final results
       // FIXME wuxun: add log-sum-exp for accurate results
-      // atomic add needed here
+      // need sync compute wg and load wg here to accumulate final results
+      // only compute wg participate into final reduce
       if (is_compute_wg) {
-        // only compute wg participate into final reduce
-
-        // check atomic
-        while(atomicLoad(params.atomic_reduce_cnt + HEAD_WG_ID) != 2) {}
-        // reset atomic due to workspace will be used across iterations
+#if 0
         if (compat::local_id::x() == 0) {
-          atomicSub(params.atomic_reduce_cnt + HEAD_WG_ID, 2);
+          cute::print("head_wg_id %d atomic cnt %d\n", HEAD_WG_ID, *(params.atomic_reduce_cnt + HEAD_WG_ID));
         }
+#endif
+        // check atomic to wait for partial results ready
+        while(atomicLoad(params.atomic_reduce_cnt + HEAD_WG_ID) != 1) {}
         clear(out_reg);
 
         // calculate offset for partial results
@@ -659,13 +664,13 @@ public:
 
         // load partial results from global memory to register
         copy(partial_attn_result1, out_reg);
-        copy(partial_attn_result2, out_reg_2);
+        // copy(partial_attn_result2, out_reg_2);
 
         // final reduce and store into out_reg
-        CUTLASS_PRAGMA_UNROLL
-        for (int i = 0; i < size(AccumShape{}); i++) {
-          out_reg(i) = out_reg(i) + out_reg_2(i);
-        }
+        // CUTLASS_PRAGMA_UNROLL
+        // for (int i = 0; i < size(AccumShape{}); i++) {
+        //   out_reg(i) = out_reg(i) + out_reg_2(i);
+        // }
       }
 
       if (is_compute_wg) {
