@@ -452,6 +452,27 @@ template <class FMHAKernel, bool isVarLen> struct ExampleRunner {
     bool passed = cutlass::reference::device::BlockCompareRelativelyEqual(block_ref_O.get(), block_O.get(),
                                                                           block_O.size(), ElementOutput{0.5}, ElementOutput{0.5});
 
+    if (!passed) {
+      // for debugging
+      std::vector<ElementOutput> host_O(block_O.size());
+      block_O.copy_to_host(host_O.data(), host_O.size());
+      compat::wait();
+      std::vector<ElementOutput> host_ref_O(block_ref_O.size());
+      block_ref_O.copy_to_host(host_ref_O.data(), host_ref_O.size());
+      compat::wait();
+      int error_cnt = 0;
+      for (int i = 0; i < host_O.size(); ++i) {
+        auto abs_diff = std::abs(host_O[i] - host_ref_O[i]);
+        auto threshold = 0.5 * (std::abs(host_O[i]) + std::abs(host_ref_O[i]));
+        if ((abs_diff > threshold) || ((abs_diff < 0.5) && (abs_diff >= 0.5*0.5))) {
+          if (error_cnt++ > 10) continue;
+          std::cout << "Output[" << i << "] = " << host_O[i] << ", Reference[" << i << "] = " << host_ref_O[i]
+                    << ", Difference: " << abs_diff << ", thr: " << threshold << std::endl;
+        }
+      }
+      std::cout << "error_cnt = " << error_cnt << ", ratio = " << (error_cnt / (float)host_O.size()) << std::endl;
+    }
+
     return passed;
   }
 
