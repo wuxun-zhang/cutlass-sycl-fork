@@ -107,6 +107,13 @@ int main(int argc, const char **argv) {
 
 #endif
 #elif defined(DECODE)
+
+#ifdef GQA
+  #define NUM_SG _16
+#else
+  #define NUM_SG _8
+#endif
+
 #if HEAD_DIM == 16
   /* Tiny config for testing */
   using ShapeQK = Shape<_1, _16, _16>;       // (q,k,d)
@@ -118,25 +125,25 @@ int main(int argc, const char **argv) {
     using ShapeQK = Shape<_1, _512, _64>;
     using ShapePV = Shape<_1, _32, _512>;
     using ShapeOut = Shape<_1, _64>;
-    using SubgroupLayoutQK = Layout<Shape<_1, _8, _1>>;
+    using SubgroupLayoutQK = Layout<Shape<_1, NUM_SG, _1>>;
 
 #elif HEAD_DIM == 96
     using ShapeQK = Shape<_1, _512, _64>;
     using ShapePV = Shape<_1, _32, _512>;
     using ShapeOut = Shape<_1, _96>;
-    using SubgroupLayoutQK = Layout<Shape<_1, _8, _1>>;
+    using SubgroupLayoutQK = Layout<Shape<_1, NUM_SG, _1>>;
 
 #elif HEAD_DIM == 128
     using ShapeQK = Shape<_1, _512, _64>;
     using ShapePV = Shape<_1, _32, _512>;
     using ShapeOut = Shape<_1, _128>;
-    using SubgroupLayoutQK = Layout<Shape<_1, _8, _1>>;
+    using SubgroupLayoutQK = Layout<Shape<_1, NUM_SG, _1>>;
 
 #elif HEAD_DIM == 192
     using ShapeQK = Shape<_1, _512, _64>;
     using ShapePV = Shape<_1, _32, _512>;
     using ShapeOut = Shape<_1, _192>;
-    using SubgroupLayoutQK = Layout<Shape<_1, _8, _1>>;
+    using SubgroupLayoutQK = Layout<Shape<_1, NUM_SG, _1>>;
 #endif
 #else
 #error Either DECODE or PREFILL should be defined.
@@ -148,5 +155,9 @@ int main(int argc, const char **argv) {
   constexpr int PipelineStages = 2;
 #endif
 
-  return FMHAConfig<false, ShapeQK, ShapePV, ShapeOut, SubgroupLayoutQK, void, PipelineStages>::run(options);
+#ifdef GQA
+  return FMHAConfig<false, ShapeQK, ShapePV, ShapeOut, SubgroupLayoutQK, void, PipelineStages, /*gqa=*/true>::run(options);
+#else
+  return FMHAConfig<false, ShapeQK, ShapePV, ShapeOut, SubgroupLayoutQK, void, PipelineStages, /*gqa=*/false>::run(options);
+#endif
 }

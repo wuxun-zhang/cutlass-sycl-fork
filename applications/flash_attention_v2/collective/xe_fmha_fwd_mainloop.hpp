@@ -171,6 +171,7 @@ struct FMHAFwdMainloop<XeDefault<Stages>, CausalMask_,
              QVCoord          blk_qv,   // WG tile indices: (Q,V)
              int              blk_k0,   // K block range: [K0,K1)
              int              blk_k1,
+             int              total_blk, // Total # of K blocks
              int              thr_id) { // Work-item ID
 
     using namespace sycl::ext::oneapi::this_work_item;
@@ -290,7 +291,7 @@ struct FMHAFwdMainloop<XeDefault<Stages>, CausalMask_,
       prefetch(prefetch_v, pVgV(_,_,_,K));
 
       /* k masking for remainder tiles */
-      if (check_remainder_k && K == blk_k1 - 1) {
+      if (check_remainder_k && K == total_blk - 1) {
         FragSRow k_rem_mask;
         int k = get<0>(tKgK(0,0,0,K,0)) + get_sub_group().get_local_id()[0];
         for (int i = 0; i < k_rem_mask.size(); i++, k += intel::sg_size) {

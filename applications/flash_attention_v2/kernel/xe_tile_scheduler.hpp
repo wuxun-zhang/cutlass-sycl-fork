@@ -92,4 +92,69 @@ struct XeFHMAIndividualTileScheduler {
   }
 };
 
+struct XeFHMAIndividualTileSchedulerGQA {
+
+  struct Params {
+    dim3 grid;
+    FastDivmod divmod_num_heads;
+    int num_heads_per_wg;
+  };
+
+  bool valid_ = true;
+  Params params;
+
+  CUTLASS_DEVICE
+  XeFHMAIndividualTileSchedulerGQA(Params const& params) : params(params) {}
+
+  template <class ProblemShape, class TileShape>
+  static Params to_underlying_arguments(
+      ProblemShape const& shape, KernelHardwareInfo hw_info,
+      TileShape const& tile_shape)
+  {
+    using namespace cute;
+
+    dim3 grid(size(ceil_div(shape.head_size_vo, get<1>(tile_shape))),     // V
+              size(ceil_div(shape.seq_len_qo,   get<0>(tile_shape))),     // Q
+              size(shape.batch * shape.num_heads_q));                     // (h,b) -- split later
+    int num_heads = shape.num_heads_q;
+
+    // each work group handle half of group heads
+    // this could be a parameter in future
+    const int num_heads_per_wg = 2;
+    int head_group_q = shape.num_heads_q / shape.num_heads_kv;
+    assert((shape.num_heads_q % shape.num_heads_kv == 0) && (head_group_q != 1) && (head_group_q % num_heads_per_wg == 0) && "XeFHMAIndividualTileSchedulerGQA only for GQA case");
+
+    grid.z = size(shape.batch * (shape.num_heads_q / num_heads_per_wg));
+    num_heads = num_heads / num_heads_per_wg;
+
+    std::cout << "Wuxun debug>> grid shape [" << grid.x << ", " << grid.y << ", " << grid.z << "]\n";
+    return Params{grid, {num_heads}, num_heads_per_wg};
+  }
+
+  template <int Num_SGs>
+  static dim3 get_grid_shape(Params const& params) {
+    return params.grid;
+  }
+
+  CUTLASS_DEVICE
+  bool is_valid() {
+    return valid_;
+  }
+
+  CUTLASS_DEVICE
+  auto get_block_coord() {
+    using namespace cute;
+    int idx_b = BlockIdxZ();
+    int head;
+    params.divmod_num_heads(idx_b, head, idx_b);
+    return make_coord(BlockIdxY(), BlockIdxX(), head, idx_b);
+  }
+
+  CUTLASS_DEVICE
+  XeFHMAIndividualTileSchedulerGQA& operator++() {
+    valid_ = false;
+    return *this;
+  }
+};
+
 }  // namespace cutlass::fmha::kernel
