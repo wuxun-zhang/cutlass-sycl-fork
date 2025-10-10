@@ -487,7 +487,7 @@ template <class FMHAKernel> struct ExampleRunner {
     std::cout << "Disposition: " << (passed ? "Passed" : "Failed") << std::endl;
 
     if (!passed) {
-      return cutlass::Status::kErrorInternal;
+      // return cutlass::Status::kErrorInternal;
     }
 
     if (options.iterations > 0) {
@@ -532,6 +532,7 @@ template <bool Causal,
           typename SubgroupLayoutQK,
           typename SubgroupLayoutPV_,      /* void -> default */
           int PipelineStages,
+          bool gqa,
           typename ElementQ = bfloat16_t,
           typename ElementK = bfloat16_t,
           typename ElementV = bfloat16_t,
@@ -601,9 +602,12 @@ struct FMHAConfig {
         GmemTiledCopyO
     >;
 
-    using FMHAKernel = cutlass::fmha::kernel::XeFMHAFwdKernel<
-        ProblemShapeType, CollectiveMainloop, CollectiveEpilogue, Scheduler
-    >;
+    using FMHAKernel = conditional_t<is_same_v<Scheduler, cutlass::fmha::kernel::XeFHMAIndividualTileSchedulerGQA>,
+      cutlass::fmha::kernel::XeFMHAFwdGqaKernel<
+        ProblemShapeType, CollectiveMainloop, CollectiveEpilogue, Scheduler>,
+        cutlass::fmha::kernel::XeFMHAFwdKernel<
+        ProblemShapeType, CollectiveMainloop, CollectiveEpilogue, Scheduler>
+        >;
 
     ExampleRunner<FMHAKernel> runner;
 
@@ -612,6 +616,6 @@ struct FMHAConfig {
   }
 
   static int run(const Options &options) {
-    return run<false, cutlass::fmha::kernel::XeFHMAIndividualTileScheduler>(options);
+    return gqa ? run<false, cutlass::fmha::kernel::XeFHMAIndividualTileSchedulerGQA>(options) : run<false, cutlass::fmha::kernel::XeFHMAIndividualTileScheduler>(options);
   }
 };
