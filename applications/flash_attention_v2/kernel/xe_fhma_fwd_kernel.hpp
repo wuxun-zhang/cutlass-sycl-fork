@@ -213,11 +213,12 @@ public:
 
       // Main loop
       CollectiveMainloop mainloop(params.mainloop, shared_storage.mainloop);
+
       mainloop(Q(_,_,head_q,idx_b),
                K(_,_,head,idx_b),
                V(_,_,head,idx_b),
                tArA, tA_max, tA_sum,
-               blk_qv, 0, k_blocks, k_blocks,
+               blk_qv, 0, k_blocks,
                thr_id);
 
       if constexpr (!is_empty_v<MainloopSharedStorage> && !is_empty_v<EpilogueSharedStorage>) {
@@ -397,65 +398,30 @@ public:
       // FragA tArA;
       // FragARow tA_max, tA_sum;
       cutlass::Array<FragA, num_heads_per_wg> tArA_array;
-      cutlass::Array<FragARow, num_heads_per_wg> tA_max_array, tA_sum_array;
+      cutlass::Array<FragARow, num_heads_per_wg> tA_max_array;
+      cutlass::Array<FragARow, num_heads_per_wg> tA_sum_array;
 
-#if 0
-      // reference impl starts from here
-      CUTLASS_PRAGMA_UNROLL
-      for (int i = 0; i < num_heads_per_wg; i++) {
-        // Main loop
-        CollectiveMainloop mainloop(params.mainloop, shared_storage.mainloop);
-        mainloop(Q(_,_,head_q + i,idx_b),
-                K(_,_,head_kv,idx_b),
-                V(_,_,head_kv,idx_b),
-                tArA_array[i], tA_max_array[i], tA_sum_array[i],
-                blk_qv, 0, k_blocks,
-                thr_id);
-
-        if constexpr (!is_empty_v<MainloopSharedStorage> && !is_empty_v<EpilogueSharedStorage>) {
-          sycl::group_barrier(get_work_group<3>());
-        }
-
-        // Epilogue
-        CollectiveEpilogue epilogue{params.epilogue, shared_storage.epilogue};
-        epilogue(O(_,_,head_q + i,idx_b),
-                tArA_array[i], tA_max_array[i], tA_sum_array[i],
-                blk_qv, thr_id);
-      }
-
-#else
-      // CUTLASS_PRAGMA_UNROLL
-      for(int split = 0; split < k_blocks; split++) {
-        int start_blk = split;
-        int end_blk = split + 1;
-
-        // CUTLASS_PRAGMA_UNROLL
-        for (int i = 0; i < num_heads_per_wg; i++) {
-          // Main loop
-          CollectiveMainloop mainloop(params.mainloop, shared_storage.mainloop);
-          mainloop(Q(_,_,head_q + i,idx_b),
-                  K(_,_,head_kv,idx_b),
-                  V(_,_,head_kv,idx_b),
-                  tArA_array[i], tA_max_array[i], tA_sum_array[i],
-                  blk_qv, start_blk, end_blk, k_blocks,
-                  thr_id);
-        }
-      }
+      // Main loop
+      CollectiveMainloop mainloop(params.mainloop, shared_storage.mainloop);
+      mainloop(Q(_,_,_,idx_b),head_q,
+              K(_,_,head_kv,idx_b),
+              V(_,_,head_kv,idx_b),
+              tArA_array, tA_max_array, tA_sum_array,
+              blk_qv, 0, k_blocks,
+              thr_id);
 
       if constexpr (!is_empty_v<MainloopSharedStorage> && !is_empty_v<EpilogueSharedStorage>) {
-          sycl::group_barrier(get_work_group<3>());
+        sycl::group_barrier(get_work_group<3>());
       }
 
       CUTLASS_PRAGMA_UNROLL
       for (int i = 0; i < num_heads_per_wg; i++) {
         // Epilogue
         CollectiveEpilogue epilogue{params.epilogue, shared_storage.epilogue};
-        epilogue(O(_,_,head_q + i,idx_b),
+        epilogue(O(_,_,head_q+i,idx_b),
                 tArA_array[i], tA_max_array[i], tA_sum_array[i],
                 blk_qv, thr_id);
       }
-#endif
-
     }
   }
 };

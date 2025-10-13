@@ -587,12 +587,18 @@ struct FMHAConfig {
 
     // Mainloop
     using MainloopDispatchPolicy = cutlass::fmha::XeDefault<PipelineStages>;
-    using CollectiveMainloop = cutlass::fmha::collective::FMHAFwdMainloop<
+    using CollectiveMainloop = conditional_t<is_same_v<Scheduler, cutlass::fmha::kernel::XeFHMAIndividualTileSchedulerGQA>,
+      cutlass::fmha::collective::FMHAFwdGqaMainloop<
         MainloopDispatchPolicy, Causal,
         TiledMMAQK, TiledMMAPV, VTiles,
         TensorQ, TensorK, TensorV,
-        GmemTiledCopyQ, GmemTiledCopyK, GmemTiledCopyV
-    >;
+        GmemTiledCopyQ, GmemTiledCopyK, GmemTiledCopyV>,
+        cutlass::fmha::collective::FMHAFwdMainloop<
+        MainloopDispatchPolicy, Causal,
+        TiledMMAQK, TiledMMAPV, VTiles,
+        TensorQ, TensorK, TensorV,
+        GmemTiledCopyQ, GmemTiledCopyK, GmemTiledCopyV>
+        >;
 
     // Epilogue
     using CollectiveEpilogue = cutlass::fmha::collective::FMHAFwdEpilogue<
