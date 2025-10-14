@@ -97,7 +97,6 @@ struct XeFHMAIndividualTileSchedulerGQA {
   struct Params {
     dim3 grid;
     FastDivmod divmod_num_heads;
-    int num_heads_per_wg;
   };
 
   bool valid_ = true;
@@ -118,17 +117,18 @@ struct XeFHMAIndividualTileSchedulerGQA {
               size(shape.batch * shape.num_heads_q));                     // (h,b) -- split later
     int num_heads = shape.num_heads_q;
 
-    // each work group handle half of group heads
-    // this could be a parameter in future
-    const int num_heads_per_wg = 2;
-    int head_group_q = shape.num_heads_q / shape.num_heads_kv;
-    assert((shape.num_heads_q % shape.num_heads_kv == 0) && (head_group_q != 1) && (head_group_q % num_heads_per_wg == 0) && "XeFHMAIndividualTileSchedulerGQA only for GQA case");
-
-    grid.z = size(shape.batch * (shape.num_heads_q / num_heads_per_wg));
-    num_heads = num_heads / num_heads_per_wg;
+    auto total_wg = grid.x * grid.y * grid.z;
+    assert((grid.z <= hw_info.sm_count / 2)  && "XeFHMAIndividualTileSchedulerGQA only enabled for decode case where num batch heads samller than SM count");
+ 
+    // partition kv seq length into `num_partitions` parts, each part will be
+    // handled by separate group of workgroup
+    // TODO: support more values in future
+    const int num_partitions = 2;
+    grid.z *= num_partitions;
+    num_heads *= num_partitions;
 
     std::cout << "Wuxun debug>> grid shape [" << grid.x << ", " << grid.y << ", " << grid.z << "]\n";
-    return Params{grid, {num_heads}, num_heads_per_wg};
+    return Params{grid, {num_heads}};
   }
 
   template <int Num_SGs>

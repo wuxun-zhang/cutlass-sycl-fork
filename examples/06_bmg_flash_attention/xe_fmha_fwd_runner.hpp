@@ -565,6 +565,7 @@ struct FMHAConfig {
     // The KernelHardwareInfo struct holds the number of EUs on the GPU with a given device ID. This
     // information is used by the underlying kernel.
     cutlass::KernelHardwareInfo hw_info;
+    hw_info.sm_count = cutlass::KernelHardwareInfo::query_device_multiprocessor_count(hw_info.device_id);
 
     using ProblemShapeType = cutlass::fmha::kernel::FMHAProblemShape;
 
@@ -587,12 +588,17 @@ struct FMHAConfig {
 
     // Mainloop
     using MainloopDispatchPolicy = cutlass::fmha::XeDefault<PipelineStages>;
-    using CollectiveMainloop = cutlass::fmha::collective::FMHAFwdMainloop<
+    using CollectiveMainloop = conditional_t<is_same_v<Scheduler, cutlass::fmha::kernel::XeFHMAIndividualTileSchedulerGQA>,
+      cutlass::fmha::collective::FMHAFwdGqaMainloop<
+        MainloopDispatchPolicy, Causal,
+        TiledMMAQK, TiledMMAPV, VTiles,
+        TensorQ, TensorK, TensorV,GmemTiledCopyQ, GmemTiledCopyK, GmemTiledCopyV>,
+        cutlass::fmha::collective::FMHAFwdMainloop<
         MainloopDispatchPolicy, Causal,
         TiledMMAQK, TiledMMAPV, VTiles,
         TensorQ, TensorK, TensorV,
-        GmemTiledCopyQ, GmemTiledCopyK, GmemTiledCopyV
-    >;
+        GmemTiledCopyQ, GmemTiledCopyK, GmemTiledCopyV>
+        >;
 
     // Epilogue
     using CollectiveEpilogue = cutlass::fmha::collective::FMHAFwdEpilogue<
