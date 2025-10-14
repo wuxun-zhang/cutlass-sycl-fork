@@ -109,9 +109,9 @@ int main(int argc, const char **argv) {
 #elif defined(DECODE)
 
 #ifdef GQA
-  #define NUM_SG _8
+  #define NUM_SG _16
 #else
-  #define NUM_SG _8
+  #define NUM_SG _16
 #endif
 
 #if HEAD_DIM == 16

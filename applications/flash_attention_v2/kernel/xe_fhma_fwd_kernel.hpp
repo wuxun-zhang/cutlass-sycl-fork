@@ -397,9 +397,9 @@ public:
       // O accumulator types
       // FragA tArA;
       // FragARow tA_max, tA_sum;
-      cutlass::Array<FragA, num_heads_per_wg> tArA_array;
-      cutlass::Array<FragARow, num_heads_per_wg> tA_max_array;
-      cutlass::Array<FragARow, num_heads_per_wg> tA_sum_array;
+      cutlass::Array<FragA, 4> tArA_array;
+      cutlass::Array<FragARow, 4> tA_max_array;
+      cutlass::Array<FragARow, 4> tA_sum_array;
 
       // Main loop
       CollectiveMainloop mainloop(params.mainloop, shared_storage.mainloop);

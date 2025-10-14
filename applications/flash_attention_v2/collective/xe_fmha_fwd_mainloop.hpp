@@ -491,9 +491,9 @@ struct FMHAFwdGqaMainloop<XeDefault<Stages>, CausalMask_,
              int head_q_start_idx,
              TensorK2D const& K_2D,     // (k,d)
              TensorV2D const& V_2D,     // (d,k)
-             cutlass::Array<FragA, 2>          & tArA_array,     // Output accumulator (q,v)
-             cutlass::Array<FragARow, 2>       & tA_max_array,   // Softmax row-wise max accumulator
-             cutlass::Array<FragARow, 2>       & tA_sum_array,   // Softmax row-wise sum accumulator
+             cutlass::Array<FragA, 4>          & tArA_array,     // Output accumulator (q,v)
+             cutlass::Array<FragARow, 4>       & tA_max_array,   // Softmax row-wise max accumulator
+             cutlass::Array<FragARow, 4>       & tA_sum_array,   // Softmax row-wise sum accumulator
              QVCoord          blk_qv,   // WG tile indices: (Q,V)
              int              blk_k0,   // K block range: [K0,K1)
              int              blk_k1,
@@ -556,12 +556,12 @@ struct FMHAFwdGqaMainloop<XeDefault<Stages>, CausalMask_,
     auto tSrK = thr_mma_qk.partition_sg_fragment_B(gK(_,_,0,0));
 
     auto tSrS = thr_mma_qk.partition_sg_fragment_C(cP);
-    cutlass::Array<decltype(tSrS), 2> tSrS_array;
+    cutlass::Array<decltype(tSrS), 4> tSrS_array;
     for(int i = 0; i < num_heads_per_wg; ++i) {
       tSrS_array[i] = thr_mma_qk.partition_sg_fragment_C(cP);
     }
     auto tArP = thr_mma_pv.partition_sg_fragment_A(cP);
-    cutlass::Array<decltype(tArP), 2> tArP_array;
+    cutlass::Array<decltype(tArP), 4> tArP_array;
     for(int i = 0; i < num_heads_per_wg; ++i) {
       tArP_array[i] = thr_mma_pv.partition_sg_fragment_A(cP);
     }
