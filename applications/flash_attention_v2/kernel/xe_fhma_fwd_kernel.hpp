@@ -415,20 +415,6 @@ public:
     CUTLASS_PRAGMA_UNROLL
     for (int i = 0; i < out1.size(); i++)
       out1(i) = out1(i) * broadcast<0>(rescale1, out1, i) + out2(i) * broadcast<0>(rescale2, out2, i);
-
-    // Element exp_scale1{sycl::native::exp2(max_prev1 * softmax_scale - max_scale)};
-    // Element exp_scale2{sycl::native::exp2(max_prev2 * softmax_scale - max_scale)};
-
-    // auto sg = compat::get_nd_item<1>().get_sub_group();
-    // auto exp_scale_bcast1 = group_broadcast(sg, exp_scale1, 0);
-    // auto exp_scale_bcast2 = group_broadcast(sg, exp_scale_2, 0);
-
-    // CUTLASS_PRAGMA_UNROLL
-    // for(int out_idx = 0; out_idx < FragsNOut; out_idx++) {
-    //   out1(out_idx) = out1(out_idx) * exp_scale_bcast1 + out2(out_idx) * exp_scale_bcast2;
-    // }
-    // // rescale exp_sum
-    // exp_sum_out = exp_sum_val1 * exp_scale_bcast1 + exp_sum_val2 * exp_scale_bcast2;
   }
 
   CUTLASS_DEVICE
@@ -465,12 +451,6 @@ public:
       head_q = first_group_wg ? head_q : (head_q - s.num_heads_q);
       int head_kv = head_q / head_group_q;
 
-#if 0
-        if (thr_id == 0) {
-          cute::print("ori batch_head_wg_id: %d, batch idx: %d, head_q: %d, head_kv: %d\n", ori_batch_head_wg_id, idx_b, head_q, head_kv);
-        }
-#endif
-
       const int k_blocks = cute::ceil_div(s.seq_len_kv, get<1>(TileShapeQK{}));
       const int num_blocks_per_group = k_blocks / num_partitions;
 
@@ -495,9 +475,6 @@ public:
       if (thr_id == 0) {
         // reset atomic counter before computation
         *(params.atomic_reduce_cnt_ptr + batch_head_wg_id) = 0;
-#if 0
-        cute::print("beginning, batch_head_wg_id: %d, atomic cnt: %d\n", batch_head_wg_id, *(params.atomic_reduce_cnt_ptr + batch_head_wg_id));
-#endif
       }
 
       // Main loop
@@ -512,12 +489,6 @@ public:
                tArA, tA_max, tA_sum,
                blk_qv, start_blk, end_blk, k_blocks,
                thr_id);
-
-#if 0
-        if (thr_id == 0) {
-          cute::print("first_group_wg -> batch_head_wg_id: %d, tArA(0): %f, tA_max(0): %f, tA_sum(0): %f\n", batch_head_wg_id, tArA(0), tA_max(0), tA_sum(0));
-        }
-#endif
 
         // Note: for first group wg, no need to store partial results into
         // workspace since we use such wg to reduce partial results
@@ -554,12 +525,6 @@ public:
         }
         copy(merged_res, tPartial);
 
-#if 0
-        if (thr_id == 0) {
-          cute::print("second_group_wg -> batch_head_wg_id: %d, tArA(0): %f, tA_max(0): %f, tA_sum(0): %f, merged_res(0): %f, merged_res_max(0): %f, merged_res_sum(0): %f\n", batch_head_wg_id, tArA(0), tA_max(0), tA_sum(0), merged_res(0), merged_res(size(FragA{}.shape())), merged_res(size(FragA{}.shape()) + 1));
-        }
-#endif
-
         // after store, set atomic cnt
         if (thr_id == 0) {
           atomicAdd(params.atomic_reduce_cnt_ptr + batch_head_wg_id, 1);
@@ -570,11 +535,6 @@ public:
       if (first_group_wg) {
         // check atomic to wait for partial results ready
         while(atomicLoad(params.atomic_reduce_cnt_ptr + batch_head_wg_id) != num_partitions) {}
-#if 0
-        if (thr_id == 0) {
-          cute::print("first_group_wg -> batch_head_wg_id: %d, atomic cnt: %d\n", batch_head_wg_id, *(params.atomic_reduce_cnt_ptr + batch_head_wg_id));
-        }
-#endif
 
         int offset = batch_head_wg_id * SGPerWG::value * intel::sg_size * num_elem_per_thead
                      + sg_id * intel::sg_size * num_elem_per_thead
@@ -595,12 +555,6 @@ public:
           tA_max_2(i) = merged_res(i + size(FragA{}.shape()));
           tA_sum_2(i) = merged_res(i + 1 + size(FragA{}.shape()));
         }
-
-#if 0
-        if (thr_id == 0) {
-          cute::print("reduction -> batch_head_wg_id: %d, tArA_2(0): %f, tA_max_2(0): %f, tA_sum_2(0): %f\n", batch_head_wg_id, tArA_2(0), tA_max_2(0), tA_sum_2(0));
-        }
-#endif
 
         reduce_split2(params, tArA, tA_max, tA_sum, tArA_2, tA_max_2, tA_sum_2);
 

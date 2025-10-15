@@ -111,7 +111,7 @@ int main(int argc, const char **argv) {
 #ifdef GQA
   #define NUM_SG _16
 #else
-  #define NUM_SG _16
+  #define NUM_SG _8
 #endif
 
 #if HEAD_DIM == 16

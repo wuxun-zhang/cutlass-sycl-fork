@@ -127,7 +127,6 @@ struct XeFHMAIndividualTileSchedulerGQA {
     grid.z *= num_partitions;
     num_heads *= num_partitions;
 
-    std::cout << "Wuxun debug>> grid shape [" << grid.x << ", " << grid.y << ", " << grid.z << "]\n";
     return Params{grid, {num_heads}};
   }
 
