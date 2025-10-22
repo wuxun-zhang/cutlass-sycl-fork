@@ -97,6 +97,7 @@ struct XeFHMAIndividualTileSchedulerGQA {
   struct Params {
     dim3 grid;
     FastDivmod divmod_num_heads;
+    int num_partitions;
   };
 
   bool valid_ = true;
@@ -122,12 +123,14 @@ struct XeFHMAIndividualTileSchedulerGQA {
  
     // partition kv seq length into `num_partitions` parts, each part will be
     // handled by separate group of workgroup
-    // TODO: support more values in future
-    const int num_partitions = 2;
+    // max seq length for each partition
+    // const int MAX_PARTITION_LENGTH = 4096;
+    // int num_partitions = cute::max(int(cute::ceil_div(shape.seq_len_kv, MAX_PARTITION_LENGTH)), 1);
+    int num_partitions = 4; // for 5/1
     grid.z *= num_partitions;
     num_heads *= num_partitions;
 
-    return Params{grid, {num_heads}};
+    return Params{grid, {num_heads}, num_partitions};
   }
 
   template <int Num_SGs>
