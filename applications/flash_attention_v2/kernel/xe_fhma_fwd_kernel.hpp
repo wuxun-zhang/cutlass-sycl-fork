@@ -361,11 +361,12 @@ public:
     auto tile_scheduler_args = TileScheduler::to_underlying_arguments(args.kernel.shape, args.hw_info, TileShapeO{});
     int num_partitions = tile_scheduler_args.num_partitions;
     int num_tail_wg = tile_scheduler_args.num_tail_wg;
+    int num_heads_per_wg = tile_scheduler_args.num_heads_per_wg;
     int num_batch_heads = args.kernel.shape.batch * args.kernel.shape.num_heads_q;
     const int wg_size = SGPerWG::value * intel::sg_size;
 
     // partial attn outputs, exp sum and max logits
-    ws_size += (num_partitions * num_batch_heads + num_tail_wg) * wg_size * num_elem_per_thead * sizeof(ElementA);
+    ws_size += (num_partitions * num_batch_heads + num_tail_wg * num_heads_per_wg) * wg_size * num_elem_per_thead * sizeof(ElementA);
     // atomic counter
     ws_size += num_batch_heads * sizeof(int32_t);
     return ws_size;
@@ -435,11 +436,14 @@ public:
 
     int sg_id = thr_id / intel::sg_size;
     int tid_in_sg = thr_id % intel::sg_size;
-    int num_batch_heads = s.batch * s.num_heads_q;
 
     TileScheduler tile_scheduler{params.scheduler};
     int num_partitions = tile_scheduler.params.num_partitions;
     int num_tail_wg = tile_scheduler.params.num_tail_wg;
+
+    const int MAX_NUM_HEADS_PER_WG = 2;
+    const int num_heads_per_wg = tile_scheduler.params.num_heads_per_wg;
+    const int num_batch_heads = s.batch * (s.num_heads_q / num_heads_per_wg);
 
     CUTLASS_PRAGMA_NO_UNROLL
     for (; tile_scheduler.is_valid(); ++tile_scheduler) {
@@ -465,6 +469,7 @@ public:
       }
 
       // important: correct q head index
+      head_q = head_q * num_heads_per_wg;
       // head_q = first_group_wg ? head_q : (head_q - s.num_heads_q);
       // head_q = head_q - partition_id * s.num_heads_q;
       head_q = head_q % s.num_heads_q;
@@ -487,47 +492,52 @@ public:
       Tensor V = make_tensor(make_gmem_ptr(dcV), make_layout(shape_V, p.dV));    // (v,k,h,b)
       Tensor O = make_tensor(make_gmem_ptr(p.O), make_layout(shape_O, p.dO));    // (q,v,h,b)
 
-      // O accumulator types
-      FragA tArA;
-      FragARow tA_max, tA_sum;
-
       if (thr_id == 0) {
         // reset atomic counter before computation
         *(params.atomic_reduce_cnt_ptr + batch_head_wg_id) = 0;
       }
 
-      // Main loop
-      CollectiveMainloop mainloop(params.mainloop, shared_storage.mainloop);
+      // O accumulator types
+      // FragA tArA;
+      // FragARow tA_max, tA_sum;
+      cutlass::Array<FragA, MAX_NUM_HEADS_PER_WG> tArA_array;
+      cutlass::Array<FragARow, MAX_NUM_HEADS_PER_WG> tA_max_array, tA_sum_array;
 
-      int start_blk = partition_id * num_blocks_per_group;
-      int end_blk = (partition_id == (num_partitions -1)) ? k_blocks : (start_blk + num_blocks_per_group);
+      for (int h_idx = 0; h_idx < num_heads_per_wg; ++h_idx) {
+        // Main loop
+        CollectiveMainloop mainloop(params.mainloop, shared_storage.mainloop);
 
-      mainloop(Q(_,_,head_q,idx_b),
-               K(_,_,head_kv,idx_b),
-               V(_,_,head_kv,idx_b),
-               tArA, tA_max, tA_sum,
-               blk_qv, start_blk, end_blk, k_blocks,
-               thr_id);
+        int start_blk = partition_id * num_blocks_per_group;
+        int end_blk = (partition_id == (num_partitions -1)) ? k_blocks : (start_blk + num_blocks_per_group);
 
-      if (!is_leader_wg) {
-        // store partial result: tArA, tA_max and tA_sum
-        int offset = partition_id * num_batch_heads * num_elem_per_thead * SGPerWG::value * intel::sg_size
-                     + batch_head_wg_id * num_elem_per_thead * SGPerWG::value * intel::sg_size
-                     + sg_id * intel::sg_size * num_elem_per_thead
-                     + tid_in_sg * num_elem_per_thead;
-        Tensor tPartial = make_tensor(params.partial_results_ptr + offset, make_shape(Int<num_elem_per_thead>{}));
-        Tensor merged_res = make_tensor<ElementA>(Int<num_elem_per_thead>{});
+        mainloop(Q(_,_,head_q + h_idx,idx_b),
+                K(_,_,head_kv,idx_b),
+                V(_,_,head_kv,idx_b),
+                tArA_array[h_idx], tA_max_array[h_idx], tA_sum_array[h_idx],
+                blk_qv, start_blk, end_blk, k_blocks,
+                thr_id);
 
-        CUTLASS_PRAGMA_UNROLL
-        for(int i = 0; i < size(FragA{}.shape()); ++i) {
-          merged_res(i) = tArA(i);
+        if (!is_leader_wg) { // worker wgs
+          // store partial result: tArA, tA_max and tA_sum
+          int offset = h_idx * num_partitions * num_batch_heads * num_elem_per_thead * SGPerWG::value * intel::sg_size
+                      + partition_id * num_batch_heads * num_elem_per_thead * SGPerWG::value * intel::sg_size
+                      + batch_head_wg_id * num_elem_per_thead * SGPerWG::value * intel::sg_size
+                      + sg_id * intel::sg_size * num_elem_per_thead
+                      + tid_in_sg * num_elem_per_thead;
+          Tensor tPartial = make_tensor(params.partial_results_ptr + offset, make_shape(Int<num_elem_per_thead>{}));
+          Tensor merged_res = make_tensor<ElementA>(Int<num_elem_per_thead>{});
+
+          CUTLASS_PRAGMA_UNROLL
+          for(int i = 0; i < size(FragA{}.shape()); ++i) {
+            merged_res(i) = tArA_array[h_idx](i);
+          }
+          CUTLASS_PRAGMA_UNROLL
+          for (int i = 0; i < size(FragARow{}.shape()); ++i) {
+            merged_res(i + size(FragA{}.shape())) = tA_max_array[h_idx](i);
+            merged_res(i + 1 + size(FragA{}.shape())) = tA_sum_array[h_idx](i);
+          }
+          copy(merged_res, tPartial);
         }
-        CUTLASS_PRAGMA_UNROLL
-        for (int i = 0; i < size(FragARow{}.shape()); ++i) {
-          merged_res(i + size(FragA{}.shape())) = tA_max(i);
-          merged_res(i + 1 + size(FragA{}.shape())) = tA_sum(i);
-        }
-        copy(merged_res, tPartial);
       }
 
       // after store, set atomic cnt
@@ -535,119 +545,50 @@ public:
         atomicAdd(params.atomic_reduce_cnt_ptr + batch_head_wg_id, 1);
       }
 
-      // if (first_group_wg) {
-      //   // [start_blk, end_blk)
-      //   int start_blk = 0, end_blk = num_blocks_per_group;
-      //   mainloop(Q(_,_,head_q,idx_b),
-      //          K(_,_,head_kv,idx_b),
-      //          V(_,_,head_kv,idx_b),
-      //          tArA, tA_max, tA_sum,
-      //          blk_qv, start_blk, end_blk, k_blocks,
-      //          thr_id);
-
-      //   // Note: for first group wg, no need to store partial results into
-      //   // workspace since we use such wg to reduce partial results
-
-      //   // after store, set atomic cnt
-      //   if (thr_id == 0) {
-      //     atomicAdd(params.atomic_reduce_cnt_ptr + batch_head_wg_id, 1);
-      //   }
-      // } else {
-      //   // [start_blk, end_blk)
-      //   int start_blk = num_blocks_per_group, end_blk = k_blocks;
-      //   mainloop(Q(_,_,head_q,idx_b),
-      //          K(_,_,head_kv,idx_b),
-      //          V(_,_,head_kv,idx_b),
-      //          tArA, tA_max, tA_sum,
-      //          blk_qv, start_blk, end_blk, k_blocks,
-      //          thr_id);
-        
-      //   // store partial result: tArA, tA_max and tA_sum
-      //   int offset = batch_head_wg_id * num_elem_per_thead * SGPerWG::value * intel::sg_size
-      //                + sg_id * intel::sg_size * num_elem_per_thead
-      //                + tid_in_sg * num_elem_per_thead;
-      //   Tensor tPartial = make_tensor(params.partial_results_ptr + offset, make_shape(Int<num_elem_per_thead>{}));
-      //   Tensor merged_res = make_tensor<ElementA>(Int<num_elem_per_thead>{});
-
-      //   CUTLASS_PRAGMA_UNROLL
-      //   for(int i = 0; i < size(FragA{}.shape()); ++i) {
-      //     merged_res(i) = tArA(i);
-      //   }
-      //   CUTLASS_PRAGMA_UNROLL
-      //   for (int i = 0; i < size(FragARow{}.shape()); ++i) {
-      //     merged_res(i + size(FragA{}.shape())) = tA_max(i);
-      //     merged_res(i + 1 + size(FragA{}.shape())) = tA_sum(i);
-      //   }
-      //   copy(merged_res, tPartial);
-
-      //   // after store, set atomic cnt
-      //   if (thr_id == 0) {
-      //     atomicAdd(params.atomic_reduce_cnt_ptr + batch_head_wg_id, 1);
-      //   }
-      // }
-
-      // first group wg is responsible for reducing partial results
+      // leader wg is responsible for reducing partial results from other worker wgs
       if (is_leader_wg) {
         // check atomic to wait for partial results ready
         while(atomicLoad(params.atomic_reduce_cnt_ptr + batch_head_wg_id) != num_partitions) {}
 
-        for (int i = 1; i < num_partitions; ++i) {
-          int offset = i * num_batch_heads * SGPerWG::value * intel::sg_size * num_elem_per_thead
-                     + batch_head_wg_id * SGPerWG::value * intel::sg_size * num_elem_per_thead
-                     + sg_id * intel::sg_size * num_elem_per_thead
-                     + tid_in_sg * num_elem_per_thead;
-          Tensor tPartial = make_tensor(params.partial_results_ptr + offset, make_shape(Int<num_elem_per_thead>{}));
-          Tensor merged_res = make_tensor<ElementA>(Int<num_elem_per_thead>{});
-          copy(tPartial, merged_res);
+        for (int h_idx = 0; h_idx < num_heads_per_wg; h_idx++) {
 
-          FragA tArA_2;
-          FragARow tA_max_2, tA_sum_2;
-          CUTLASS_PRAGMA_UNROLL
-          for(int i = 0; i < size(FragA{}.shape()); ++i) {
-            tArA_2(i) = merged_res(i);
+          for (int i = 1; i < num_partitions; ++i) {
+            int offset = h_idx * num_partitions * num_batch_heads * num_elem_per_thead * SGPerWG::value * intel::sg_size
+                      + i * num_batch_heads * SGPerWG::value * intel::sg_size * num_elem_per_thead
+                      + batch_head_wg_id * SGPerWG::value * intel::sg_size * num_elem_per_thead
+                      + sg_id * intel::sg_size * num_elem_per_thead
+                      + tid_in_sg * num_elem_per_thead;
+            Tensor tPartial = make_tensor(params.partial_results_ptr + offset, make_shape(Int<num_elem_per_thead>{}));
+            Tensor merged_res = make_tensor<ElementA>(Int<num_elem_per_thead>{});
+            copy(tPartial, merged_res);
+
+            FragA tArA_2;
+            FragARow tA_max_2, tA_sum_2;
+            CUTLASS_PRAGMA_UNROLL
+            for(int i = 0; i < size(FragA{}.shape()); ++i) {
+              tArA_2(i) = merged_res(i);
+            }
+
+            CUTLASS_PRAGMA_UNROLL
+            for (int i = 0; i < size(FragARow{}.shape()); ++i) {
+              tA_max_2(i) = merged_res(i + size(FragA{}.shape()));
+              tA_sum_2(i) = merged_res(i + 1 + size(FragA{}.shape()));
+            }
+
+            reduce_split2(params, tArA_array[h_idx], tA_max_array[h_idx], tA_sum_array[h_idx], tArA_2, tA_max_2, tA_sum_2);
           }
 
-          CUTLASS_PRAGMA_UNROLL
-          for (int i = 0; i < size(FragARow{}.shape()); ++i) {
-            tA_max_2(i) = merged_res(i + size(FragA{}.shape()));
-            tA_sum_2(i) = merged_res(i + 1 + size(FragA{}.shape()));
+          // require group barrier if using SLM
+          if constexpr (!is_empty_v<MainloopSharedStorage> && !is_empty_v<EpilogueSharedStorage>) {
+            sycl::group_barrier(get_work_group<3>());
           }
 
-          reduce_split2(params, tArA, tA_max, tA_sum, tArA_2, tA_max_2, tA_sum_2);
+          // Epilogue
+          CollectiveEpilogue epilogue{params.epilogue, shared_storage.epilogue};
+          epilogue(O(_,_,head_q+h_idx,idx_b),
+                  tArA_array[h_idx], tA_max_array[h_idx], tA_sum_array[h_idx],
+                  blk_qv, thr_id);
         }
-
-        // int offset = batch_head_wg_id * SGPerWG::value * intel::sg_size * num_elem_per_thead
-        //              + sg_id * intel::sg_size * num_elem_per_thead
-        //              + tid_in_sg * num_elem_per_thead;
-        // Tensor tPartial = make_tensor(params.partial_results_ptr + offset, make_shape(Int<num_elem_per_thead>{}));
-        // Tensor merged_res = make_tensor<ElementA>(Int<num_elem_per_thead>{});
-        // copy(tPartial, merged_res);
-
-        // FragA tArA_2;
-        // FragARow tA_max_2, tA_sum_2;
-        // CUTLASS_PRAGMA_UNROLL
-        // for(int i = 0; i < size(FragA{}.shape()); ++i) {
-        //   tArA_2(i) = merged_res(i);
-        // }
-
-        // CUTLASS_PRAGMA_UNROLL
-        // for (int i = 0; i < size(FragARow{}.shape()); ++i) {
-        //   tA_max_2(i) = merged_res(i + size(FragA{}.shape()));
-        //   tA_sum_2(i) = merged_res(i + 1 + size(FragA{}.shape()));
-        // }
-
-        // reduce_split2(params, tArA, tA_max, tA_sum, tArA_2, tA_max_2, tA_sum_2);
-
-        // require group barrier if using SLM
-        if constexpr (!is_empty_v<MainloopSharedStorage> && !is_empty_v<EpilogueSharedStorage>) {
-          sycl::group_barrier(get_work_group<3>());
-        }
-
-        // Epilogue
-        CollectiveEpilogue epilogue{params.epilogue, shared_storage.epilogue};
-        epilogue(O(_,_,head_q,idx_b),
-                tArA, tA_max, tA_sum,
-                blk_qv, thr_id);
       }
     }
   }
