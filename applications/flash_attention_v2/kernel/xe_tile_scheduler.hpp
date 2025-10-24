@@ -98,6 +98,7 @@ struct XeFHMAIndividualTileSchedulerGQA {
     dim3 grid;
     FastDivmod divmod_num_heads;
     int num_partitions;
+    int num_tail_wg;
   };
 
   bool valid_ = true;
@@ -119,18 +120,29 @@ struct XeFHMAIndividualTileSchedulerGQA {
     int num_heads = shape.num_heads_q;
 
     auto total_wg = grid.x * grid.y * grid.z;
+    // FIXME: replace with runtime check
+    assert(shape.batch == 1);
     assert((grid.z <= hw_info.sm_count / 2)  && "XeFHMAIndividualTileSchedulerGQA only enabled for decode case where num batch heads samller than SM count");
  
-    // partition kv seq length into `num_partitions` parts, each part will be
-    // handled by separate group of workgroup
-    // max seq length for each partition
-    // const int MAX_PARTITION_LENGTH = 4096;
-    // int num_partitions = cute::max(int(cute::ceil_div(shape.seq_len_kv, MAX_PARTITION_LENGTH)), 1);
-    int num_partitions = 4; // for 5/1
-    grid.z *= num_partitions;
+    // how many partitions each KV seq is split into
+    int num_partitions = hw_info.sm_count / grid.z;
+    // this is for the case where sm_count cannot be divisible by num_batch_heads,
+    // for some head/work group, the KV seq need to split into `num_partitions+1`
+    // partitions to occupy all xecores, here we assme first `tail_wg` work groups
+    // will handle one more partition
+    // for eample, num head is 8, sm_count is 20, so first 20%8=4 work groups
+    // will handle 3 partitions, the rest 4 work groups will handle 2 partitions
+    int num_tail_wg = hw_info.sm_count % grid.z;
+
+    // assume grid shape (1, 1, hw_info.sm_count) to use all xecores
+    grid.z = hw_info.sm_count;
+    // int num_partitions = 4; // for 5/1
+    // grid.z *= num_partitions;
     num_heads *= num_partitions;
 
-    return Params{grid, {num_heads}, num_partitions};
+    std::cout << "Debug>> grid shape [" << grid.x << ", " << grid.y << ", " << grid.z << "]\n";
+    std::cout << "Debug>> num partitions: " << num_partitions << ", num tail wg: " << num_tail_wg << "\n";
+    return Params{grid, {num_heads}, num_partitions, num_tail_wg};
   }
 
   template <int Num_SGs>

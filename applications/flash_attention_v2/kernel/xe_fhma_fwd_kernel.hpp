@@ -358,12 +358,14 @@ public:
   static int get_workspace_size(Arguments const &args) {
     int ws_size = 0;
     // TODO: support more values in future
-    int num_partitions = 4; // for 5/1
+    auto tile_scheduler_args = TileScheduler::to_underlying_arguments(args.kernel.shape, args.hw_info, TileShapeO{});
+    int num_partitions = tile_scheduler_args.num_partitions;
+    int num_tail_wg = tile_scheduler_args.num_tail_wg;
     int num_batch_heads = args.kernel.shape.batch * args.kernel.shape.num_heads_q;
     const int wg_size = SGPerWG::value * intel::sg_size;
 
     // partial attn outputs, exp sum and max logits
-    ws_size += num_partitions * num_batch_heads * wg_size * num_elem_per_thead * sizeof(ElementA);
+    ws_size += (num_partitions * num_batch_heads + num_tail_wg) * wg_size * num_elem_per_thead * sizeof(ElementA);
     // atomic counter
     ws_size += num_batch_heads * sizeof(int32_t);
     return ws_size;
@@ -436,28 +438,40 @@ public:
     int num_batch_heads = s.batch * s.num_heads_q;
 
     TileScheduler tile_scheduler{params.scheduler};
-    const int num_partitions = tile_scheduler.params.num_partitions;
+    int num_partitions = tile_scheduler.params.num_partitions;
+    int num_tail_wg = tile_scheduler.params.num_tail_wg;
 
     CUTLASS_PRAGMA_NO_UNROLL
     for (; tile_scheduler.is_valid(); ++tile_scheduler) {
       auto [blk_q, blk_v, head_q, idx_b] = tile_scheduler.get_block_coord(); // (Q,V,h,b)
       auto blk_qv = make_coord(blk_q, blk_v);
 
+      // correct batch idx due to tail wg exists
+      if (idx_b >= s.batch) {
+        idx_b -= 1;
+      }
+
       // first group of wg to process first partition of KV seq
       // const bool first_group_wg = ori_batch_head_wg_id < num_batch_heads;
       // id of partition that current wg is processing
       const int partition_id = ori_batch_head_wg_id / num_batch_heads;
       const bool is_leader_wg = partition_id == 0;
-      // const int batch_head_wg_id = first_group_wg ? ori_batch_head_wg_id : (ori_batch_head_wg_id - num_batch_heads);
       const int batch_head_wg_id = ori_batch_head_wg_id % num_batch_heads;
+
+      // first several heads split into one more partition which will be handled
+      // by tail work groups
+      if (batch_head_wg_id < num_tail_wg) {
+        num_partitions += 1;
+      }
 
       // important: correct q head index
       // head_q = first_group_wg ? head_q : (head_q - s.num_heads_q);
-      head_q = head_q - partition_id * s.num_heads_q;
+      // head_q = head_q - partition_id * s.num_heads_q;
+      head_q = head_q % s.num_heads_q;
       int head_kv = head_q / head_group_q;
 
       const int k_blocks = cute::ceil_div(s.seq_len_kv, get<1>(TileShapeQK{}));
-      const int num_blocks_per_group = k_blocks / num_partitions;
+      int num_blocks_per_group = k_blocks / num_partitions;
 
       auto shape_Q = make_shape(s.seq_len_qo, s.head_size_qk, s.num_heads_q,  s.batch);
       auto shape_K = make_shape(s.seq_len_kv, s.head_size_qk, s.num_heads_kv, s.batch);
