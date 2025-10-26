@@ -97,8 +97,6 @@ struct XeFHMAIndividualTileSchedulerGQA {
   struct Params {
     dim3 grid;
     FastDivmod divmod_num_heads;
-    int num_partitions;
-    int num_tail_wg;
   };
 
   bool valid_ = true;
@@ -138,11 +136,10 @@ struct XeFHMAIndividualTileSchedulerGQA {
     grid.z = hw_info.sm_count;
     // int num_partitions = 4; // for 5/1
     // grid.z *= num_partitions;
-    num_heads *= num_partitions;
+    // num_heads *= num_partitions;
 
     std::cout << "Debug>> grid shape [" << grid.x << ", " << grid.y << ", " << grid.z << "]\n";
-    std::cout << "Debug>> num partitions: " << num_partitions << ", num tail wg: " << num_tail_wg << "\n";
-    return Params{grid, {num_heads}, num_partitions, num_tail_wg};
+    return Params{grid, {num_heads}};
   }
 
   template <int Num_SGs>
