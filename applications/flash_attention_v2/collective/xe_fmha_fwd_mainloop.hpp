@@ -272,8 +272,8 @@ struct FMHAFwdMainloop<XeDefault<Stages>, CausalMask_,
     /* Main loop, blocked in k. */
     for (int K = blk_k0; K < blk_k1; K++) {
       /* Split barrier to keep threads together */
-      constexpr int barrier_scope = 2;    /* WG scope */
-      barrier_arrive(barrier_scope);
+      // constexpr int barrier_scope = 2;    /* WG scope */
+      // barrier_arrive(barrier_scope);
 
       /* GEMM 1: S = K * Q */
       clear(tSrS);    /* TODO: fuse w/ initial gemm call */
@@ -327,7 +327,7 @@ struct FMHAFwdMainloop<XeDefault<Stages>, CausalMask_,
         prefetch(prefetch_k, pKgK(_,_,_,K+Stages,D));
       }
 
-      barrier_wait(barrier_scope);
+      // barrier_wait(barrier_scope);
     }
   }
 

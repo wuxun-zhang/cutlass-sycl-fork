@@ -125,14 +125,16 @@ struct XeFHMAIndividualTileSchedulerGQA {
     assert(shape.batch == 1);
     assert((grid.z <= hw_info.sm_count / 2)  && "XeFHMAIndividualTileSchedulerGQA only enabled for decode case where num batch heads samller than SM count");
 
+#if 1
     // assume grid shape (1, 1, hw_info.sm_count) to use all xecores
     grid.z = hw_info.sm_count;
     
     int num_heads_per_wg = 1;
+    // if (hw_info.sm_count % num_heads == 0) {
     if (num_heads > 6) {
       assert((num_heads % 2 == 0) && "num query head much be divisible by 2");
       num_heads = num_heads / 2;
-      num_heads_per_wg *=2;
+      num_heads_per_wg *= 2;
     }
 
     int num_batch_heads = shape.batch * num_heads;
@@ -145,6 +147,13 @@ struct XeFHMAIndividualTileSchedulerGQA {
     // for eample, num head is 8, sm_count is 20, so first 20%8=4 work groups
     // will handle 3 partitions, the rest 4 work groups will handle 2 partitions
     int num_tail_wg = hw_info.sm_count % num_batch_heads;
+#else
+    int num_batch_heads = shape.batch * num_heads;
+    int num_partitions = hw_info.sm_count / num_batch_heads;
+    int num_tail_wg = 0;
+    int num_heads_per_wg = 0;
+    grid.z *= num_partitions;
+#endif
 
     num_heads *= num_partitions;
 

@@ -464,7 +464,8 @@ public:
 
       // first several heads split into one more partition which will be handled
       // by tail work groups
-      if (batch_head_wg_id < num_tail_wg) {
+      if (num_tail_wg > 0) {
+      // if (batch_head_wg_id < num_tail_wg) {
         num_partitions += 1;
       }
 
@@ -503,12 +504,12 @@ public:
       cutlass::Array<FragA, MAX_NUM_HEADS_PER_WG> tArA_array;
       cutlass::Array<FragARow, MAX_NUM_HEADS_PER_WG> tA_max_array, tA_sum_array;
 
-      for (int h_idx = 0; h_idx < num_heads_per_wg; ++h_idx) {
-        // Main loop
-        CollectiveMainloop mainloop(params.mainloop, shared_storage.mainloop);
-
+      // Main loop
+      CollectiveMainloop mainloop(params.mainloop, shared_storage.mainloop);
+      int h_idx = 0;
+      // for (int h_idx = 0; h_idx < num_heads_per_wg; ++h_idx) {
         int start_blk = partition_id * num_blocks_per_group;
-        int end_blk = (partition_id == (num_partitions -1)) ? k_blocks : (start_blk + num_blocks_per_group);
+        int end_blk = (partition_id == (num_partitions - 1)) ? k_blocks : (start_blk + num_blocks_per_group);
 
         mainloop(Q(_,_,head_q + h_idx,idx_b),
                 K(_,_,head_kv,idx_b),
@@ -516,9 +517,19 @@ public:
                 tArA_array[h_idx], tA_max_array[h_idx], tA_sum_array[h_idx],
                 blk_qv, start_blk, end_blk, k_blocks,
                 thr_id);
+        if (num_heads_per_wg > 1) {
+          h_idx++;
+          mainloop(Q(_,_,head_q + h_idx,idx_b),
+                  K(_,_,head_kv,idx_b),
+                  V(_,_,head_kv,idx_b),
+                  tArA_array[h_idx], tA_max_array[h_idx], tA_sum_array[h_idx],
+                  blk_qv, start_blk, end_blk, k_blocks,
+                  thr_id);
+        }
 
         if (!is_leader_wg) { // worker wgs
           // store partial result: tArA, tA_max and tA_sum
+          h_idx = 0;
           int offset = h_idx * num_partitions * num_batch_heads * num_elem_per_thead * SGPerWG::value * intel::sg_size
                       + partition_id * num_batch_heads * num_elem_per_thead * SGPerWG::value * intel::sg_size
                       + batch_head_wg_id * num_elem_per_thead * SGPerWG::value * intel::sg_size
@@ -537,8 +548,23 @@ public:
             merged_res(i + 1 + size(FragA{}.shape())) = tA_sum_array[h_idx](i);
           }
           copy(merged_res, tPartial);
+          
+          if (num_heads_per_wg > 1) {
+            h_idx++;
+            offset += num_partitions * num_batch_heads * num_elem_per_thead * SGPerWG::value * intel::sg_size;
+
+            CUTLASS_PRAGMA_UNROLL
+            for(int i = 0; i < size(FragA{}.shape()); ++i) {
+              merged_res(i) = tArA_array[h_idx](i);
+            }
+            CUTLASS_PRAGMA_UNROLL
+            for (int i = 0; i < size(FragARow{}.shape()); ++i) {
+              merged_res(i + size(FragA{}.shape())) = tA_max_array[h_idx](i);
+              merged_res(i + 1 + size(FragA{}.shape())) = tA_sum_array[h_idx](i);
+            }
+            copy(merged_res, tPartial);
+          }
         }
-      }
 
       // after store, set atomic cnt
       if (thr_id == 0) {
