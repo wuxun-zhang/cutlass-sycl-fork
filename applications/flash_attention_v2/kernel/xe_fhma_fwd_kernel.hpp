@@ -301,7 +301,7 @@ public:
   // this is for storing partial results from different KV partitions
   static constexpr int num_elem_per_thead = (size(FragA{}.shape()) + 2 * size(FragARow{}.shape()) + 15) / 16 * 16;
   // FIXME: maybe exceed more than 4 paritions???
-  static const int max_num_partitions = 4;
+  static const int max_num_partitions = 8;
 
   // Device side arguments
   struct KernelArguments {
@@ -440,6 +440,8 @@ public:
       out1(i) = out1(i) * broadcast<0>(rescale1, out1, i) + out2(i) * broadcast<0>(rescale2, out2, i);
   }
 
+  #define DEBUG_PRINT 0
+
   CUTLASS_DEVICE
   void operator()(Params const &params, char *smem_buf)
   {
@@ -466,7 +468,7 @@ public:
     // to guarantee all wg process similar number of blocks of KV
     int num_blocks_per_wg = cute::ceil_div(total_k_blocks, GridDimZ());
 
-#if 0
+#if DEBUG_PRINT
     if (thr_id == 0 && wg_id == 0) {
       cute::print("Debug>> total_k_blocks: %d, num_blocks_per_wg: %d, local_k_blocks: %d, num_batch_heads: %d\n",
              total_k_blocks, num_blocks_per_wg, local_k_blocks, num_batch_heads);
@@ -507,7 +509,7 @@ public:
       // worker wg only to compute partial results
       bool is_leader_wg = wg_id < num_batch_heads;
 
-#if 0
+#if DEBUG_PRINT
     if (thr_id == 0) {
       cute::print("Debug>> wg id %d, start_batch_head_id: %d, num_computed_blocks: %d\n",
              wg_id, start_batch_head_id, num_computed_blocks);
@@ -560,7 +562,7 @@ public:
         // partition id of start batch head id in current wg
         int partition_id = get_partition_id(wg_id, batch_head_id, num_blocks_per_wg, local_k_blocks);
 
-#if 0
+#if DEBUG_PRINT
     if (thr_id == 0) {
       cute::print("Debug>> wg id %d, batch_head_id: %d, partition_id: %d\n",
              wg_id, batch_head_id, partition_id);
@@ -603,7 +605,7 @@ public:
       if (is_leader_wg) {
         int num_partitions = get_num_partitions(wg_id, num_blocks_per_wg, local_k_blocks);
 
-#if 0
+#if DEBUG_PRINT
     if (thr_id == 0) {
       cute::print("Debug>> wg id %d, num_partitions: %d\n", wg_id, num_partitions);
     }
