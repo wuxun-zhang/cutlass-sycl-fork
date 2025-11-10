@@ -123,7 +123,10 @@ struct FMHAFwdMainloop<XeDefault<Stages>, CausalMask_,
 
   using SingleFragA = FragC<TiledMMAPV>;                          // (atom val,q',v')
   using FragA = expand_sg_fragment_t<SingleFragA, 1, VTiles>;     // (atom val,q',v',VV)
+  // static_assert(is_same_v<decltype(SingleFragA{}.shape()), float>, "dtype not matched");
+  // static_assert(is_same_v<decltype(FragA{}.shape()), float>, "dtype not matched");
   using FragARow = decltype(reduce<1>(FragA{}, sycl::plus<void>{}));
+  // static_assert(is_same_v<decltype(FragARow{}.shape()), float>, "dtype not matched");
   using ElementA = typename TiledMMAPV::ValTypeD;
 
   static constexpr bool CausalMask = CausalMask_;

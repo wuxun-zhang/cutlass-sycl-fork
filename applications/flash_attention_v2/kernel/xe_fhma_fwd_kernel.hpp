@@ -282,21 +282,29 @@ public:
   using ElementO = typename CollectiveEpilogue::TensorO::element_type;
   using StrideO = decltype(stride(typename CollectiveEpilogue::TensorO{}));
 
+  // Important: make sure multiple of 16 element for each copy
+  // this is for storing partial results from different KV partitions
+  static constexpr int num_elem_per_thread = (size(FragA{}.shape()) + 2 * size(FragARow{}.shape()) + 15) / 16 * 16;
+  static const int max_num_partitions = 8;
+
+  // shared memory storage for partial attn results
+  struct SharedStoragePartialAttnResults {
+    // idx of batch heads need to store partial results
+    cute::array<int, 4> batch_heads_idx;
+    cute::array<ElementA, 4 * SGPerWG::value * intel::sg_size * num_elem_per_thread> partial_results;
+  };
+
   // Kernel level shared memory storage
   using MainloopSharedStorage = typename CollectiveMainloop::SharedStorage;
   using EpilogueSharedStorage = typename CollectiveEpilogue::SharedStorage;
   union SharedStorage {
     MainloopSharedStorage mainloop;
     EpilogueSharedStorage epilogue;
+    SharedStoragePartialAttnResults partial;
   };
 
   static constexpr int SharedStorageSize = is_empty_v<SharedStorage> ? size_t(0)
                                                                      : sizeof(SharedStorage);
-
-  // Important: make sure multiple of 16 element for each copy
-  // this is for storing partial results from different KV partitions
-  static constexpr int num_elem_per_thread = (size(FragA{}.shape()) + 2 * size(FragARow{}.shape()) + 15) / 16 * 16;
-  static const int max_num_partitions = 8;
 
   // Device side arguments
   struct KernelArguments {
@@ -494,6 +502,13 @@ public:
 
       // compute num computed blocks for start batch head id
       int num_computed_blocks = (start_batch_head_id == 0) ? (wg_id * num_blocks_per_wg) : (wg_id * num_blocks_per_wg - start_batch_head_id * local_k_blocks);
+#if 0
+      if (ThreadIdxX() == 0) {
+        // debug print
+        printf("wg_id: %d, start_batch_head_id: %d, num_computed_blocks: %d, num_blocks_per_wg: %d, local_k_blocks: %d\n",
+               wg_id, start_batch_head_id, num_computed_blocks, num_blocks_per_wg, local_k_blocks);
+      }
+#endif
       int start_blk, end_blk, head_q, idx_b, head_kv;
       // leader wg is also responsible for reducing partial results, while other
       // worker wg only to compute partial results
@@ -506,6 +521,9 @@ public:
 
       // Main loop
       CollectiveMainloop mainloop(params.mainloop, shared_storage.mainloop);
+
+      // copy counters
+      int copy_cnt = 0;
 
       // compute blocks budget remained for each wg
       int block_budget_remained = num_blocks_per_wg;
@@ -542,17 +560,14 @@ public:
               blk_qv, start_blk, end_blk, local_k_blocks,
               thr_id);
 
-        // partition id of start batch head id in current wg
-        int partition_id = get_partition_id(wg_id, batch_head_id, num_blocks_per_wg, local_k_blocks);
-
-        // store partial result: tArA, tA_max and tA_sum
-        int offset = batch_head_id * max_num_partitions * num_elem_per_thread * SGPerWG::value * intel::sg_size
-                    + partition_id * num_elem_per_thread * SGPerWG::value * intel::sg_size
-                    + sg_id * intel::sg_size * num_elem_per_thread
-                    + tid_in_sg * num_elem_per_thread;
-        Tensor tPartial = make_tensor(params.partial_results_ptr + offset, make_shape(Int<num_elem_per_thread>{}));
+        if (thr_id == 0) {
+          shared_storage.partial.batch_heads_idx[copy_cnt] = batch_head_id;
+        }
+        int offset_slm = copy_cnt * SGPerWG::value * intel::sg_size * num_elem_per_thread
+                           + sg_id * intel::sg_size * num_elem_per_thread
+                           + tid_in_sg * num_elem_per_thread;
+        Tensor tPartial_slm = make_tensor(make_smem_ptr(&shared_storage.partial.partial_results[offset_slm]), make_shape(Int<num_elem_per_thread>{}));
         Tensor merged_res = make_tensor<ElementA>(Int<num_elem_per_thread>{});
-
         CUTLASS_PRAGMA_UNROLL
         for(int i = 0; i < size(FragA{}.shape()); ++i) {
           merged_res(i) = tArA(i);
@@ -562,12 +577,40 @@ public:
           merged_res(2 * i + size(FragA{}.shape())) = tA_max(i);
           merged_res(2 * i + 1 + size(FragA{}.shape())) = tA_sum(i);
         }
-        copy(merged_res, tPartial);
+        copy(merged_res, tPartial_slm);
+        copy_cnt++;
+#if 0
+      if (thr_id == 0) {
+        // debug print
+        printf("wg_id: %d, batch_head_id: %d,copy_cnt: %d\n", wg_id, batch_head_id, copy_cnt);
+      }
+#endif
+        // // partition id of start batch head id in current wg
+        // int partition_id = get_partition_id(wg_id, batch_head_id, num_blocks_per_wg, local_k_blocks);
 
-        // after store, set atomic cnt
-        if (thr_id == 0) {
-          atomicAdd(params.atomic_reduce_cnt_ptr + batch_head_id, 1);
-        }
+        // // store partial result: tArA, tA_max and tA_sum
+        // int offset = batch_head_id * max_num_partitions * num_elem_per_thread * SGPerWG::value * intel::sg_size
+        //             + partition_id * num_elem_per_thread * SGPerWG::value * intel::sg_size
+        //             + sg_id * intel::sg_size * num_elem_per_thread
+        //             + tid_in_sg * num_elem_per_thread;
+        // Tensor tPartial = make_tensor(params.partial_results_ptr + offset, make_shape(Int<num_elem_per_thread>{}));
+        // Tensor merged_res = make_tensor<ElementA>(Int<num_elem_per_thread>{});
+
+        // CUTLASS_PRAGMA_UNROLL
+        // for(int i = 0; i < size(FragA{}.shape()); ++i) {
+        //   merged_res(i) = tArA(i);
+        // }
+        // CUTLASS_PRAGMA_UNROLL
+        // for (int i = 0; i < size(FragARow{}.shape()); ++i) {
+        //   merged_res(2 * i + size(FragA{}.shape())) = tA_max(i);
+        //   merged_res(2 * i + 1 + size(FragA{}.shape())) = tA_sum(i);
+        // }
+        // copy(merged_res, tPartial);
+
+        // // after store, set atomic cnt
+        // if (thr_id == 0) {
+        //   atomicAdd(params.atomic_reduce_cnt_ptr + batch_head_id, 1);
+        // }
 
         // advance to next batch head id
         if (is_update_batch_head_id) {
@@ -575,6 +618,46 @@ public:
           if (batch_head_id >= num_batch_heads) {
             break;
           }
+        }
+      }
+
+      // require group barrier due to using of SLM for partial results
+      sycl::group_barrier(get_work_group<3>());
+
+      // mainloop finished, now ready copy partial results from SLM to workspace
+      for (int cnt_ = 0; cnt_ < copy_cnt; cnt_++) {
+        int batch_head_id = shared_storage.partial.batch_heads_idx[cnt_];
+        // partition id of start batch head id in current wg
+        int partition_id = get_partition_id(wg_id, batch_head_id, num_blocks_per_wg, local_k_blocks);
+
+        // store partial result: tArA, tA_max and tA_sum
+        int offset = batch_head_id * max_num_partitions * num_elem_per_thread * SGPerWG::value * intel::sg_size
+                    + partition_id * num_elem_per_thread * SGPerWG::value * intel::sg_size
+                    + sg_id * intel::sg_size * num_elem_per_thread
+                    + tid_in_sg * num_elem_per_thread;
+        Tensor tPartial = make_tensor(params.partial_results_ptr + offset, make_shape(Int<num_elem_per_thread>{}));
+        // Tensor merged_res = make_tensor<ElementA>(Int<num_elem_per_thread>{});
+
+        int offset_slm = cnt_ * SGPerWG::value * intel::sg_size * num_elem_per_thread
+                           + sg_id * intel::sg_size * num_elem_per_thread
+                           + tid_in_sg * num_elem_per_thread;
+        Tensor tPartial_slm = make_tensor(make_smem_ptr(&shared_storage.partial.partial_results[offset_slm]), make_shape(Int<num_elem_per_thread>{}));
+
+        // CUTLASS_PRAGMA_UNROLL
+        // for(int i = 0; i < size(FragA{}.shape()); ++i) {
+        //   merged_res(i) = shared_storage.partial.partial_results[offset_slm + i];
+        // }
+        // CUTLASS_PRAGMA_UNROLL
+        // for (int i = 0; i < size(FragARow{}.shape()); ++i) {
+        //   merged_res(2 * i + size(FragA{}.shape())) = shared_storage.partial.partial_results[offset_slm + 2 * i + size(FragA{}.shape())];
+        //   merged_res(2 * i + 1 + size(FragA{}.shape())) = shared_storage.partial.partial_results[offset_slm + 2 * i + 1 + size(FragA{}.shape())];
+        // }
+        copy(tPartial_slm, tPartial);
+        // copy(merged_res, tPartial);
+
+        // after store, set atomic cnt
+        if (thr_id == 0) {
+          atomicAdd(params.atomic_reduce_cnt_ptr + batch_head_id, 1);
         }
       }
 
