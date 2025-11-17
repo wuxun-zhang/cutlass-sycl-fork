@@ -379,6 +379,7 @@ public:
     ElementA *partial_results_ptr = nullptr;
     // for atomic add
     int32_t *atomic_reduce_cnt_ptr = nullptr;
+    int32_t *atomic_global_sync_cnt_ptr = nullptr;
   };
 
   //
@@ -386,14 +387,15 @@ public:
   //
 
   static Params to_underlying_arguments(Arguments const &args, void *workspace) {
+    int32_t *atomic_global_sync_cnt_ptr = reinterpret_cast<int32_t *>(workspace);
     int num_batch_heads = args.kernel.shape.batch * args.kernel.shape.num_heads_q;
-    int32_t *atomic_reduce_cnt_ptr = reinterpret_cast<int32_t *>(workspace);
+    int32_t *atomic_reduce_cnt_ptr = atomic_global_sync_cnt_ptr + args.hw_info.sm_count;
     ElementA *partial_results_ptr = reinterpret_cast<ElementA *>(atomic_reduce_cnt_ptr + num_batch_heads);
     return {args.kernel,
             CollectiveMainloop::to_underlying_arguments(args.mainloop, workspace),
             CollectiveEpilogue::to_underlying_arguments(args.epilogue, workspace),
             TileScheduler::to_underlying_arguments(args.kernel.shape, args.hw_info, TileShapeO{}),
-            partial_results_ptr, atomic_reduce_cnt_ptr
+            partial_results_ptr, atomic_reduce_cnt_ptr, atomic_global_sync_cnt_ptr
           };
   }
 
@@ -419,15 +421,17 @@ public:
     ws_size += (max_num_partitions * num_batch_heads) * wg_size * num_elem_per_thread * sizeof(ElementA);
     // atomic counter
     ws_size += num_batch_heads * sizeof(int32_t);
+    ws_size += args.hw_info.sm_count * sizeof(int32_t);
     return ws_size;
   }
 
   static cutlass::Status initialize_workspace(Arguments const &args, void *workspace = nullptr,
                                               cudaStream_t stream = nullptr, CudaHostAdapter *cuda_adapter = nullptr) {
+    compat::fill(reinterpret_cast<int32_t*>(workspace), (int32_t)0, args.hw_info.sm_count);
     int num_batch_heads = args.kernel.shape.batch * args.kernel.shape.num_heads_q;
-    compat::fill(reinterpret_cast<int32_t*>(workspace), (int32_t)0, num_batch_heads);
-    auto partial_ws_count = (get_workspace_size(args) - num_batch_heads * sizeof(int32_t)) / sizeof(ElementA);
-    auto* partial_results_ptr = reinterpret_cast<ElementA*>(reinterpret_cast<int32_t*>(workspace) + num_batch_heads);
+    compat::fill(reinterpret_cast<int32_t*>(workspace) + args.hw_info.sm_count, (int32_t)0, num_batch_heads);
+    auto partial_ws_count = (get_workspace_size(args) - (args.hw_info.sm_count + num_batch_heads) * sizeof(int32_t)) / sizeof(ElementA);
+    auto* partial_results_ptr = reinterpret_cast<ElementA*>(reinterpret_cast<int32_t*>(workspace) + args.hw_info.sm_count + num_batch_heads);
     compat::fill(partial_results_ptr, (ElementA)0, partial_ws_count);
     return Status::kSuccess;
   }
@@ -561,6 +565,13 @@ public:
       int block_budget_remained = num_blocks_per_wg;
       int batch_head_id = start_batch_head_id;
       bool is_update_batch_head_id = false;
+
+      const int max_num_head_heads_per_wg = 4;
+      cute::array<int, max_num_head_heads_per_wg> batch_head_ids_processed;
+      cute::array<int, max_num_head_heads_per_wg> start_blks_per_batch;
+      cute::array<int, max_num_head_heads_per_wg> end_blks_per_batch;
+      int bh_cnt = 0;
+
       while (block_budget_remained > 0) {
         int num_new_blocks = local_k_blocks - num_computed_blocks;
         if (num_new_blocks <= block_budget_remained) {
@@ -581,22 +592,120 @@ public:
           is_update_batch_head_id = false;
         }
 
-        head_q = batch_head_id % s.num_heads_q;
-        idx_b = batch_head_id / s.num_heads_q;
+        batch_head_ids_processed[bh_cnt] = batch_head_id;
+        start_blks_per_batch[bh_cnt] = start_blk;
+        end_blks_per_batch[bh_cnt] = end_blk;
+        bh_cnt += 1;
+
+        // advance to next batch head id
+        if (is_update_batch_head_id) {
+          batch_head_id += 1;
+          if (batch_head_id >= num_batch_heads) {
+            break;
+          }
+        }
+      }
+
+#if 0
+      if (thr_id == 0) {
+        cute::print("wg_id: %d, processed batch heads: %d, start_batch_head_id: %d, num_computed_blocks: %d\n", wg_id, bh_cnt, start_batch_head_id, num_computed_blocks);
+      }
+#endif
+
+      // compute in reverse order
+      for (int bh_idx = bh_cnt - 1; bh_idx >= 0; bh_idx--) {
+        if (thr_id == 0) {
+          *(params.atomic_global_sync_cnt_ptr + wg_id) = 0;
+        }
+        head_q = batch_head_ids_processed[bh_idx] % s.num_heads_q;
+        idx_b = batch_head_ids_processed[bh_idx] / s.num_heads_q;
         head_kv = head_q / head_group_q;
         // mainloop
-        mainloop(Q(_,_,head_q,idx_b),
-              K(_,_,head_kv,idx_b),
-              V(_,_,head_kv,idx_b),
-              tArA, tA_max, tA_sum,
-              blk_qv, start_blk, end_blk, local_k_blocks,
-              thr_id, s.seq_len_kv, /*for causal*/0, 0);
+
+        int start_blk = start_blks_per_batch[bh_idx];
+        int end_blk = end_blks_per_batch[bh_idx];
+        // for loop + reminder
+        int num_full_loops = (end_blk - start_blk) / 20;
+        int reminder = (end_blk - start_blk) % 20;
+
+        CUTLASS_PRAGMA_UNROLL
+        for (int loop_cnt = 0; loop_cnt < num_full_loops; loop_cnt++) {
+          mainloop(Q(_,_,head_q,idx_b),
+                  K(_,_,head_kv,idx_b),
+                  V(_,_,head_kv,idx_b),
+                  tArA, tA_max, tA_sum,
+                  blk_qv, start_blk + loop_cnt * 20, start_blk + (loop_cnt + 1) * 20, local_k_blocks,
+                  thr_id, s.seq_len_kv, /*for causal*/0, 0);
+        }
+        if (reminder > 0) {
+          mainloop(Q(_,_,head_q,idx_b),
+                  K(_,_,head_kv,idx_b),
+                  V(_,_,head_kv,idx_b),
+                  tArA, tA_max, tA_sum,
+                  blk_qv, start_blk + num_full_loops * 20, end_blk, local_k_blocks,
+                  thr_id, s.seq_len_kv, /*for causal*/0, 0);
+        }
+
+        // if (end_blk - start_blk >= 20) {
+        //   mainloop(Q(_,_,head_q,idx_b),
+        //           K(_,_,head_kv,idx_b),
+        //           V(_,_,head_kv,idx_b),
+        //           tArA, tA_max, tA_sum,
+        //           blk_qv, start_blk, start_blk + 20, local_k_blocks,
+        //           thr_id, s.seq_len_kv, /*for causal*/0, 0);
+
+        //   // if (thr_id == 0) {
+        //   //   atomicAdd(params.atomic_global_sync_cnt_ptr + wg_id, 1);
+        //   // }
+
+        //   // while(atomicLoad(params.atomic_global_sync_cnt_ptr + wg_id) == 20) {}
+
+        //   mainloop(Q(_,_,head_q,idx_b),
+        //           K(_,_,head_kv,idx_b),
+        //           V(_,_,head_kv,idx_b),
+        //           tArA, tA_max, tA_sum,
+        //           blk_qv, start_blk + 20, start_blk + 40, local_k_blocks,
+        //           thr_id, s.seq_len_kv, /*for causal*/0, 0);
+          
+        //   // if (thr_id == 0) {
+        //   //   atomicAdd(params.atomic_global_sync_cnt_ptr + wg_id, 1);
+        //   // }
+
+        //   // while(atomicLoad(params.atomic_global_sync_cnt_ptr + wg_id) == 20) {}
+
+        //   mainloop(Q(_,_,head_q,idx_b),
+        //           K(_,_,head_kv,idx_b),
+        //           V(_,_,head_kv,idx_b),
+        //           tArA, tA_max, tA_sum,
+        //           blk_qv, start_blk + 40, start_blk + 60, local_k_blocks,
+        //           thr_id, s.seq_len_kv, /*for causal*/0, 0);
+          
+        //   // if (thr_id == 0) {
+        //   //   atomicAdd(params.atomic_global_sync_cnt_ptr + wg_id, 1);
+        //   // }
+
+        //   // while(atomicLoad(params.atomic_global_sync_cnt_ptr + wg_id) == 20) {}
+
+        //   mainloop(Q(_,_,head_q,idx_b),
+        //           K(_,_,head_kv,idx_b),
+        //           V(_,_,head_kv,idx_b),
+        //           tArA, tA_max, tA_sum,
+        //           blk_qv, start_blk + 60, start_blk + 80, local_k_blocks,
+        //           thr_id, s.seq_len_kv, /*for causal*/0, 0);
+        // } else {
+        //   mainloop(Q(_,_,head_q,idx_b),
+        //       K(_,_,head_kv,idx_b),
+        //       V(_,_,head_kv,idx_b),
+        //       tArA, tA_max, tA_sum,
+        //       blk_qv, start_blks_per_batch[bh_idx], end_blks_per_batch[bh_idx], local_k_blocks,
+        //       thr_id, s.seq_len_kv, /*for causal*/0, 0);
+        // }
 
         // partition id of start batch head id in current wg
-        int partition_id = get_partition_id(wg_id, batch_head_id, num_blocks_per_wg, local_k_blocks);
+        int partition_id = get_partition_id(wg_id, batch_head_ids_processed[bh_idx], num_blocks_per_wg, local_k_blocks);
 
         // store partial result: tArA, tA_max and tA_sum
-        int offset = batch_head_id * max_num_partitions * num_elem_per_thread * SGPerWG::value * intel::sg_size
+        int offset = batch_head_ids_processed[bh_idx] * max_num_partitions * num_elem_per_thread * SGPerWG::value * intel::sg_size
                     + partition_id * num_elem_per_thread * SGPerWG::value * intel::sg_size
                     + sg_id * intel::sg_size * num_elem_per_thread
                     + tid_in_sg * num_elem_per_thread;
@@ -613,20 +722,81 @@ public:
           merged_res(2 * i + 1 + size(FragA{}.shape())) = tA_sum(i);
         }
         copy(merged_res, tPartial);
+      }
 
+      for (int bh_idx = bh_cnt - 1; bh_idx >= 0; bh_idx--) {
         // after store, set atomic cnt
         if (thr_id == 0) {
-          atomicAdd(params.atomic_reduce_cnt_ptr + batch_head_id, 1);
-        }
-
-        // advance to next batch head id
-        if (is_update_batch_head_id) {
-          batch_head_id += 1;
-          if (batch_head_id >= num_batch_heads) {
-            break;
-          }
+          atomicAdd(params.atomic_reduce_cnt_ptr + batch_head_ids_processed[bh_idx], 1);
         }
       }
+
+      // while (block_budget_remained > 0) {
+      //   int num_new_blocks = local_k_blocks - num_computed_blocks;
+      //   if (num_new_blocks <= block_budget_remained) {
+      //     // finished current batch head id
+      //     start_blk = num_computed_blocks;
+      //     end_blk = start_blk + num_new_blocks;
+
+      //     // update states
+      //     num_computed_blocks = 0;
+      //     block_budget_remained -= num_new_blocks;
+      //     is_update_batch_head_id = true;
+      //   } else {
+      //     // budget cannot afford finishing current batch head id
+      //     start_blk = num_computed_blocks;
+      //     end_blk = start_blk + block_budget_remained;
+
+      //     block_budget_remained = 0;
+      //     is_update_batch_head_id = false;
+      //   }
+
+      //   head_q = batch_head_id % s.num_heads_q;
+      //   idx_b = batch_head_id / s.num_heads_q;
+      //   head_kv = head_q / head_group_q;
+      //   // mainloop
+      //   mainloop(Q(_,_,head_q,idx_b),
+      //         K(_,_,head_kv,idx_b),
+      //         V(_,_,head_kv,idx_b),
+      //         tArA, tA_max, tA_sum,
+      //         blk_qv, start_blk, end_blk, local_k_blocks,
+      //         thr_id, s.seq_len_kv, /*for causal*/0, 0);
+
+      //   // partition id of start batch head id in current wg
+      //   int partition_id = get_partition_id(wg_id, batch_head_id, num_blocks_per_wg, local_k_blocks);
+
+      //   // store partial result: tArA, tA_max and tA_sum
+      //   int offset = batch_head_id * max_num_partitions * num_elem_per_thread * SGPerWG::value * intel::sg_size
+      //               + partition_id * num_elem_per_thread * SGPerWG::value * intel::sg_size
+      //               + sg_id * intel::sg_size * num_elem_per_thread
+      //               + tid_in_sg * num_elem_per_thread;
+      //   Tensor tPartial = make_tensor(params.partial_results_ptr + offset, make_shape(Int<num_elem_per_thread>{}));
+      //   Tensor merged_res = make_tensor<ElementA>(Int<num_elem_per_thread>{});
+
+      //   CUTLASS_PRAGMA_UNROLL
+      //   for(int i = 0; i < size(FragA{}.shape()); ++i) {
+      //     merged_res(i) = tArA(i);
+      //   }
+      //   CUTLASS_PRAGMA_UNROLL
+      //   for (int i = 0; i < size(FragARow{}.shape()); ++i) {
+      //     merged_res(2 * i + size(FragA{}.shape())) = tA_max(i);
+      //     merged_res(2 * i + 1 + size(FragA{}.shape())) = tA_sum(i);
+      //   }
+      //   copy(merged_res, tPartial);
+
+      //   // after store, set atomic cnt
+      //   if (thr_id == 0) {
+      //     atomicAdd(params.atomic_reduce_cnt_ptr + batch_head_id, 1);
+      //   }
+
+      //   // advance to next batch head id
+      //   if (is_update_batch_head_id) {
+      //     batch_head_id += 1;
+      //     if (batch_head_id >= num_batch_heads) {
+      //       break;
+      //     }
+      //   }
+      // }
 
       if (is_leader_wg) {
         int num_partitions = get_num_partitions(wg_id, num_blocks_per_wg, local_k_blocks);
