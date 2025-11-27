@@ -521,7 +521,8 @@ public:
 
     CUTLASS_PRAGMA_NO_UNROLL
     for (; tile_scheduler.is_valid(); ++tile_scheduler) {
-      auto [blk_q, blk_v, start_batch_head_id] = tile_scheduler.get_block_coord(); // (Q,V, batch_head_idx)
+      // auto [blk_q, blk_v, start_batch_head_id] = tile_scheduler.get_block_coord(); // (Q,V, batch_head_idx)
+      auto [blk_q, blk_v, start_batch_head_id, num_heads_per_wg, start_blk, end_blk] = tile_scheduler.get_block_coord(); // (Q,V, batch_head_idx)
       auto blk_qv = make_coord(blk_q, blk_v);
 
       auto shape_Q = make_shape(s.seq_len_qo, s.head_size_qk, s.num_heads_q,  s.batch);
@@ -544,7 +545,8 @@ public:
 
       // compute num computed blocks for start batch head id
       int num_computed_blocks = (start_batch_head_id == 0) ? (wg_id * num_blocks_per_wg) : (wg_id * num_blocks_per_wg - start_batch_head_id * local_k_blocks);
-      int start_blk, end_blk, head_q, idx_b, head_kv;
+      // int start_blk, end_blk
+      int head_q, idx_b, head_kv;
       // leader wg is also responsible for reducing partial results, while other
       // worker wg only to compute partial results
       bool is_leader_wg = wg_id < num_batch_heads;
@@ -557,32 +559,14 @@ public:
       // Main loop
       CollectiveMainloop mainloop(params.mainloop, shared_storage.mainloop);
 
-      // compute blocks budget remained for each wg
-      int block_budget_remained = num_blocks_per_wg;
-      int batch_head_id = start_batch_head_id;
-      bool is_update_batch_head_id = false;
-      while (block_budget_remained > 0) {
-        int num_new_blocks = local_k_blocks - num_computed_blocks;
-        if (num_new_blocks <= block_budget_remained) {
-          // finished current batch head id
-          start_blk = num_computed_blocks;
-          end_blk = start_blk + num_new_blocks;
-
-          // update states
-          num_computed_blocks = 0;
-          block_budget_remained -= num_new_blocks;
-          is_update_batch_head_id = true;
-        } else {
-          // budget cannot afford finishing current batch head id
-          start_blk = num_computed_blocks;
-          end_blk = start_blk + block_budget_remained;
-
-          block_budget_remained = 0;
-          is_update_batch_head_id = false;
+      for (int h_cnt = 0; h_cnt < num_heads_per_wg; ++h_cnt) {
+        int cur_batch_head_id = start_batch_head_id + h_cnt;
+        if (cur_batch_head_id >= num_batch_heads) {
+          break;
         }
 
-        head_q = batch_head_id % s.num_heads_q;
-        idx_b = batch_head_id / s.num_heads_q;
+        head_q = cur_batch_head_id % s.num_heads_q;
+        idx_b = cur_batch_head_id / s.num_heads_q;
         head_kv = head_q / head_group_q;
         // mainloop
         mainloop(Q(_,_,head_q,idx_b),
@@ -592,11 +576,24 @@ public:
               blk_qv, start_blk, end_blk, local_k_blocks,
               thr_id, s.seq_len_kv, /*for causal*/0, 0);
 
+        // mainloop(Q(_,_,head_q,idx_b),
+        //       K(_,_,head_kv,idx_b),
+        //       V(_,_,head_kv,idx_b),
+        //       tArA, tA_max, tA_sum,
+        //       blk_qv, start_blk + 32, end_blk, local_k_blocks,
+        //       thr_id, s.seq_len_kv, /*for causal*/0, 0);
+        
         // partition id of start batch head id in current wg
-        int partition_id = get_partition_id(wg_id, batch_head_id, num_blocks_per_wg, local_k_blocks);
+        // int partition_id = get_partition_id(wg_id, batch_head_id, num_blocks_per_wg, local_k_blocks);
+
+        int partition_id = 0;
+        if (num_heads_per_wg > 1) {
+          // tailing wg to process remaining blocks hence second partition
+          partition_id = start_blk > 0 ? 2 : 1;
+        }
 
         // store partial result: tArA, tA_max and tA_sum
-        int offset = batch_head_id * max_num_partitions * num_elem_per_thread * SGPerWG::value * intel::sg_size
+        int offset = cur_batch_head_id * max_num_partitions * num_elem_per_thread * SGPerWG::value * intel::sg_size
                     + partition_id * num_elem_per_thread * SGPerWG::value * intel::sg_size
                     + sg_id * intel::sg_size * num_elem_per_thread
                     + tid_in_sg * num_elem_per_thread;
@@ -616,20 +613,84 @@ public:
 
         // after store, set atomic cnt
         if (thr_id == 0) {
-          atomicAdd(params.atomic_reduce_cnt_ptr + batch_head_id, 1);
-        }
-
-        // advance to next batch head id
-        if (is_update_batch_head_id) {
-          batch_head_id += 1;
-          if (batch_head_id >= num_batch_heads) {
-            break;
-          }
+          atomicAdd(params.atomic_reduce_cnt_ptr + cur_batch_head_id, 1);
         }
       }
 
+      // compute blocks budget remained for each wg
+      // int block_budget_remained = num_blocks_per_wg;
+      // int batch_head_id = start_batch_head_id;
+      // bool is_update_batch_head_id = false;
+      // while (block_budget_remained > 0) {
+      //   int num_new_blocks = local_k_blocks - num_computed_blocks;
+      //   if (num_new_blocks <= block_budget_remained) {
+      //     // finished current batch head id
+      //     start_blk = num_computed_blocks;
+      //     end_blk = start_blk + num_new_blocks;
+
+      //     // update states
+      //     num_computed_blocks = 0;
+      //     block_budget_remained -= num_new_blocks;
+      //     is_update_batch_head_id = true;
+      //   } else {
+      //     // budget cannot afford finishing current batch head id
+      //     start_blk = num_computed_blocks;
+      //     end_blk = start_blk + block_budget_remained;
+
+      //     block_budget_remained = 0;
+      //     is_update_batch_head_id = false;
+      //   }
+
+      //   head_q = batch_head_id % s.num_heads_q;
+      //   idx_b = batch_head_id / s.num_heads_q;
+      //   head_kv = head_q / head_group_q;
+      //   // mainloop
+      //   mainloop(Q(_,_,head_q,idx_b),
+      //         K(_,_,head_kv,idx_b),
+      //         V(_,_,head_kv,idx_b),
+      //         tArA, tA_max, tA_sum,
+      //         blk_qv, start_blk, end_blk, local_k_blocks,
+      //         thr_id, s.seq_len_kv, /*for causal*/0, 0);
+
+      //   // partition id of start batch head id in current wg
+      //   int partition_id = get_partition_id(wg_id, batch_head_id, num_blocks_per_wg, local_k_blocks);
+
+      //   // store partial result: tArA, tA_max and tA_sum
+      //   int offset = batch_head_id * max_num_partitions * num_elem_per_thread * SGPerWG::value * intel::sg_size
+      //               + partition_id * num_elem_per_thread * SGPerWG::value * intel::sg_size
+      //               + sg_id * intel::sg_size * num_elem_per_thread
+      //               + tid_in_sg * num_elem_per_thread;
+      //   Tensor tPartial = make_tensor(params.partial_results_ptr + offset, make_shape(Int<num_elem_per_thread>{}));
+      //   Tensor merged_res = make_tensor<ElementA>(Int<num_elem_per_thread>{});
+
+      //   CUTLASS_PRAGMA_UNROLL
+      //   for(int i = 0; i < size(FragA{}.shape()); ++i) {
+      //     merged_res(i) = tArA(i);
+      //   }
+      //   CUTLASS_PRAGMA_UNROLL
+      //   for (int i = 0; i < size(FragARow{}.shape()); ++i) {
+      //     merged_res(2 * i + size(FragA{}.shape())) = tA_max(i);
+      //     merged_res(2 * i + 1 + size(FragA{}.shape())) = tA_sum(i);
+      //   }
+      //   copy(merged_res, tPartial);
+
+      //   // after store, set atomic cnt
+      //   if (thr_id == 0) {
+      //     atomicAdd(params.atomic_reduce_cnt_ptr + batch_head_id, 1);
+      //   }
+
+      //   // advance to next batch head id
+      //   if (is_update_batch_head_id) {
+      //     batch_head_id += 1;
+      //     if (batch_head_id >= num_batch_heads) {
+      //       break;
+      //     }
+      //   }
+      // }
+
       if (is_leader_wg) {
-        int num_partitions = get_num_partitions(wg_id, num_blocks_per_wg, local_k_blocks);
+        // int num_partitions = get_num_partitions(wg_id, num_blocks_per_wg, local_k_blocks);
+        int num_partitions = 2;
 
         // check atomic to wait for partial results ready
         while(atomicLoad(params.atomic_reduce_cnt_ptr + wg_id) != num_partitions) {}
@@ -638,7 +699,7 @@ public:
         clear(tA_max);
         clear(tA_sum);
 
-        for (int i = 0; i < num_partitions; ++i) {
+        for (int i = 1; i < num_partitions; ++i) {
           int offset = wg_id * max_num_partitions * SGPerWG::value * intel::sg_size * num_elem_per_thread
                      + i * SGPerWG::value * intel::sg_size * num_elem_per_thread
                      + sg_id * intel::sg_size * num_elem_per_thread

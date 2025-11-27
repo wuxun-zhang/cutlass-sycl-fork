@@ -148,9 +148,53 @@ struct XeFHMAIndividualPersistentTileScheduler {
     int num_blocks_per_wg = cute::ceil_div(total_num_kv_blocks, GridDimZ());
 
     // compute start batch head id for current wg
-    int start_batch_head_id = wg_id * num_blocks_per_wg / local_num_kv_blocks_;
+    // int start_batch_head_id = wg_id * num_blocks_per_wg / local_num_kv_blocks_;
 
-    return make_coord(BlockIdxY(), BlockIdxX(), start_batch_head_id);
+    // how many heads each wg needs process
+    int num_heads_per_wg = 0;
+    int start_blk = 0, end_blk = 0;
+    int start_batch_head_id = 0;
+
+    // wg id 0 ~ num_batch_heads-1 process the first num_blocks_per_wg blocks for each head
+    // wg id num_batch_heads ~ 2*num_batch_heads-1 process the second num_blocks_per_wg blocks for each head
+    // wg id 2*num_batch_heads ~ SM_count process left blocks from all heads (balanced)
+    if (wg_id < num_batch_heads_) {
+      // single sequence
+      num_heads_per_wg = 1;
+      start_batch_head_id = wg_id;
+      start_blk = 0;
+      end_blk = num_blocks_per_wg;
+    } else if (wg_id < 2 * num_batch_heads_) {
+      // single sequence
+      num_heads_per_wg = 1;
+      start_batch_head_id = wg_id - num_batch_heads_;
+      start_blk = num_blocks_per_wg;
+      end_blk = num_blocks_per_wg * 2;
+    } else {
+      // multiple sequences
+      int remaining_wg_id = wg_id - 2 * num_batch_heads_;
+      int num_remaining_wg = GridDimZ() - 2 * num_batch_heads_;
+      // int num_remaining_blocks = total_num_kv_blocks - 2 * num_batch_heads_ * num_blocks_per_wg;
+      // int num_remaining_blocks_per_wg = cute::ceil_div(num_remaining_blocks, num_remaining_wg);
+      
+      num_heads_per_wg = cute::ceil_div(num_batch_heads_, num_remaining_wg);
+      num_heads_per_wg = 0;
+
+      start_blk = 0;
+      end_blk = 0;
+      // start_blk = num_blocks_per_wg;
+      // end_blk = 2 * num_blocks_per_wg;
+      start_batch_head_id = remaining_wg_id * num_heads_per_wg;
+    }
+
+#if 0
+    if (int(ThreadIdxX()) == 0) {
+      printf("wg_id: %d, start_bh_id: %d, num_heads_per_wg: %d, start_blk: %d, end_blk: %d\n",
+        wg_id, start_batch_head_id, num_heads_per_wg, start_blk, end_blk);
+    }
+#endif
+
+    return make_coord(BlockIdxY(), BlockIdxX(), start_batch_head_id, num_heads_per_wg, start_blk, end_blk);
   }
 
   CUTLASS_DEVICE
