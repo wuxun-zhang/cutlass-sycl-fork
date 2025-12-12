@@ -175,7 +175,8 @@ struct FMHAFwdMainloop<XeDefault<Stages>, CausalMask_,
              int              thr_id,
              int              seq_len,
              int              full_tile_offset,
-             int              discard_seq_coord) {
+             int              discard_seq_coord,
+             bool             need_init = false) {
     using namespace sycl::ext::oneapi::this_work_item;
 
     // Short dimension names:
@@ -251,7 +252,7 @@ struct FMHAFwdMainloop<XeDefault<Stages>, CausalMask_,
 
     /* Initialization steps for first block: Q/K prefetch, O init */
     /* TODO: limit D prefetch for large head size, and reorder K prefetches */
-    if (blk_k0 == 0) {
+    if (blk_k0 == 0 || need_init) {
       for (int D = 0; D < size<3>(pQgQ); D++) {
         prefetch(prefetch_q, pQgQ(_,_,_,D));
       }
