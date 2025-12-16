@@ -291,6 +291,8 @@ public:
   // Type Aliases
   //
   using ProblemShape = ProblemShape_;
+  using VariableLength = cutlass::fmha::collective::VariableLength;
+  static constexpr bool is_var_len = cutlass::fmha::collective::is_variable_length_v<typename ProblemShape::SeqLenType>;
 
   // Mainloop derived types
   using CollectiveMainloop = CollectiveMainloop_;
@@ -319,7 +321,7 @@ public:
   using ElementA = typename CollectiveMainloop::ElementA;
 
   // Tile scheduler derived types
-  static_assert(is_same_v<TileScheduler_, XeFHMAIndividualPersistentTileScheduler>);
+  static_assert(is_same_v<TileScheduler_, XeFMHAPersistentTileScheduler> || is_same_v<TileScheduler_, XeFMHAPersistentVarLenTileScheduler>);
   using TileScheduler = TileScheduler_;
   using TileSchedulerParams = typename TileScheduler::Params;
 
@@ -385,8 +387,13 @@ public:
   // Methods
   //
 
+  static int get_num_batch_heads(Arguments const &args) {
+    auto bs = is_var_len ? 1 : args.kernel.shape.batch;
+    return bs * args.kernel.shape.num_heads_q;
+  }
+
   static Params to_underlying_arguments(Arguments const &args, void *workspace) {
-    int num_batch_heads = args.kernel.shape.batch * args.kernel.shape.num_heads_q;
+    int num_batch_heads = get_num_batch_heads(args);
     int32_t *atomic_reduce_cnt_ptr = reinterpret_cast<int32_t *>(workspace);
     ElementA *partial_results_ptr = reinterpret_cast<ElementA *>(atomic_reduce_cnt_ptr + num_batch_heads);
     return {args.kernel,
@@ -403,7 +410,7 @@ public:
       return false;
     }
     // current kernel only support num batch heads less than total XeCore count
-    if (args.kernel.shape.batch * args.kernel.shape.num_heads_q > args.hw_info.sm_count) {
+    if (get_num_batch_heads(args) > args.hw_info.sm_count) {
       return false;
     }
     return CollectiveMainloop::can_implement(args.mainloop)
@@ -412,7 +419,7 @@ public:
 
   static int get_workspace_size(Arguments const &args) {
     int ws_size = 0;
-    int num_batch_heads = args.kernel.shape.batch * args.kernel.shape.num_heads_q;
+    int num_batch_heads = get_num_batch_heads(args);
     const int wg_size = SGPerWG::value * intel::sg_size;
 
     // partial attn outputs, exp sum and max logits
@@ -424,7 +431,7 @@ public:
 
   static cutlass::Status initialize_workspace(Arguments const &args, void *workspace = nullptr,
                                               cudaStream_t stream = nullptr, CudaHostAdapter *cuda_adapter = nullptr) {
-    int num_batch_heads = args.kernel.shape.batch * args.kernel.shape.num_heads_q;
+    int num_batch_heads = get_num_batch_heads(args);
     compat::fill(reinterpret_cast<int32_t*>(workspace), (int32_t)0, num_batch_heads);
     auto partial_ws_count = (get_workspace_size(args) - num_batch_heads * sizeof(int32_t)) / sizeof(ElementA);
     auto* partial_results_ptr = reinterpret_cast<ElementA*>(reinterpret_cast<int32_t*>(workspace) + num_batch_heads);
@@ -437,6 +444,15 @@ public:
   }
 
   static dim3 get_block_shape() { return dim3(SGPerWG::value * intel::sg_size, 1, 1); }
+
+  CUTLASS_DEVICE
+  Shape<int, int> get_sequence_length_shape(ProblemShape const& problem_shape, int const& batch) {
+    if constexpr (is_var_len) {
+      return cutlass::fmha::collective::apply_variable_length(Shape<VariableLength, VariableLength>{problem_shape.seq_len_qo, problem_shape.seq_len_kv}, batch);
+    } else {
+      return Shape<int, int>{problem_shape.seq_len_qo, problem_shape.seq_len_kv};
+    }
+  }
 
   CUTLASS_DEVICE
   int get_partition_id(const int cur_wg_id, const int batch_head_id, const int num_blocks_per_wg, const int local_k_blocks) {
@@ -509,13 +525,32 @@ public:
 
     int sg_id = thr_id / intel::sg_size;
     int tid_in_sg = thr_id % intel::sg_size;
-    int num_batch_heads = s.batch * s.num_heads_q;
 
-    int local_k_blocks = cute::ceil_div(s.seq_len_kv, get<1>(TileShapeQK{}));
-    // total number of blocks need to be processed across all wgs
-    int total_k_blocks = local_k_blocks * num_batch_heads;
-    // to guarantee all wg process similar number of blocks of KV
-    int num_blocks_per_wg = cute::ceil_div(total_k_blocks, GridDimZ());
+    int seq_len_kv, seq_len_qo, batch_dim;
+    int local_k_blocks, total_k_blocks, num_blocks_per_wg, num_batch_heads;
+    if constexpr (is_var_len) {
+      // total seq len for the batch
+      auto kv_cumulative = s.seq_len_kv.cumulative_length;
+      auto qo_cumulative = s.seq_len_qo.cumulative_length;
+      seq_len_kv = kv_cumulative[s.batch] - kv_cumulative[0];
+      seq_len_qo = qo_cumulative[s.batch] - qo_cumulative[0];
+
+      batch_dim = 1;
+      num_batch_heads = batch_dim * s.num_heads_q;
+
+      local_k_blocks
+    } else {
+      seq_len_kv = s.seq_len_kv;
+      batch_dim = s.batch;
+      num_batch_heads = batch_dim * s.num_heads_q;
+
+      local_k_blocks = cute::ceil_div(seq_len_kv, get<1>(TileShapeQK{}));
+      // total number of blocks need to be processed across all wgs
+      total_k_blocks = local_k_blocks * num_batch_heads;
+      // to guarantee all wg process similar number of blocks of KV
+      num_blocks_per_wg = cute::ceil_div(total_k_blocks, GridDimZ());
+    }
+    
 
     TileScheduler tile_scheduler{params.scheduler, get<1>(TileShapeQK{}), local_k_blocks, num_batch_heads};
 
@@ -524,10 +559,10 @@ public:
       auto [blk_q, blk_v, start_batch_head_id] = tile_scheduler.get_block_coord(); // (Q,V, batch_head_idx)
       auto blk_qv = make_coord(blk_q, blk_v);
 
-      auto shape_Q = make_shape(s.seq_len_qo, s.head_size_qk, s.num_heads_q,  s.batch);
-      auto shape_K = make_shape(s.seq_len_kv, s.head_size_qk, s.num_heads_kv, s.batch);
-      auto shape_V = make_shape(s.head_size_vo, s.seq_len_kv, s.num_heads_kv, s.batch);
-      auto shape_O = make_shape(s.seq_len_qo, s.head_size_vo, s.num_heads_kv, s.batch);
+      auto shape_Q = make_shape(s.seq_len_qo, s.head_size_qk, s.num_heads_q,  batch_dim);
+      auto shape_K = make_shape(seq_len_kv, s.head_size_qk, s.num_heads_kv, batch_dim);
+      auto shape_V = make_shape(s.head_size_vo, seq_len_kv, s.num_heads_kv, batch_dim);
+      auto shape_O = make_shape(s.seq_len_qo, s.head_size_vo, s.num_heads_kv, batch_dim);
 
       auto dcQ = const_cast<ElementQ*>(p.Q);  // de-const these for uniformity
       auto dcK = const_cast<ElementK*>(p.K);
@@ -590,7 +625,7 @@ public:
               V(_,_,head_kv,idx_b),
               tArA, tA_max, tA_sum,
               blk_qv, start_blk, end_blk, local_k_blocks,
-              thr_id, s.seq_len_kv, /*for causal*/0, 0);
+              thr_id, seq_len_kv, /*for causal*/0, 0);
 
         // partition id of start batch head id in current wg
         int partition_id = get_partition_id(wg_id, batch_head_id, num_blocks_per_wg, local_k_blocks);

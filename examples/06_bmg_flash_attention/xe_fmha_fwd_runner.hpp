@@ -242,7 +242,11 @@ template <class FMHAKernel, bool isVarLen = false> struct ExampleRunner {
     int max_seqlen_kv = 0;
 
     for (int i = 0; i < num_batches; i++) {
+#if defined DECODE
       int seqlen_q = cutlass::round_up(generate_positive_int(dist_q, rng), AlignmentQ);
+#else
+      int seqlen_q = 1;
+#endif
       int seqlen_kv = cutlass::round_up(generate_positive_int(dist_kv, rng), AlignmentKV);
 
       total_seqlen_q += seqlen_q;
@@ -705,7 +709,7 @@ struct FMHAConfig {
     >;
 
     static_assert(!(persistent & Causal), "persistent SDPA kernel not support Causal yet");
-    using FMHAKernel = conditional_t<is_same_v<Scheduler, cutlass::fmha::kernel::XeFHMAIndividualPersistentTileScheduler>,
+    using FMHAKernel = conditional_t<is_same_v<Scheduler, cutlass::fmha::kernel::XeFMHAPersistentTileScheduler>,
       cutlass::fmha::kernel::XeFMHAFwdDynamicSplitKernel<
         ProblemShapeType, CollectiveMainloop, CollectiveEpilogue, Scheduler>,
         cutlass::fmha::kernel::XeFMHAFwdKernel<
@@ -720,9 +724,10 @@ struct FMHAConfig {
 
   static int run(const Options &options) {
     if (options.varlen) {
-      return run<true, cutlass::fmha::kernel::XeFHMAIndividualTileScheduler>(options);
+      return persistent ? run<true, cutlass::fmha::kernel::XeFMHAPersistentVarLenTileScheduler>(options) :
+              run<true, cutlass::fmha::kernel::XeFHMAIndividualTileScheduler>(options);
     } else {
-      return persistent ? run<false, cutlass::fmha::kernel::XeFHMAIndividualPersistentTileScheduler>(options) :
+      return persistent ? run<false, cutlass::fmha::kernel::XeFMHAPersistentTileScheduler>(options) :
               run<false, cutlass::fmha::kernel::XeFHMAIndividualTileScheduler>(options);
     }
   }
