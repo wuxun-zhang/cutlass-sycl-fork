@@ -851,7 +851,11 @@ struct ExampleRunner {
         block_O.get(), stride_O,
         block_K_cache.get(), stride_K_cache,
         block_V_cache.get(), stride_V_cache,
-      },
+      };
+    }
+
+    typename FMHAKernel::Arguments arguments {
+      kernel_args,
       {
         options.softmax_scale,
         options.use_paged_kv ? paged_kv_cache.page_table.get() : nullptr,
@@ -860,7 +864,7 @@ struct ExampleRunner {
       },
       {},
       hw_info,
-      options.num_kv_splits,
+      options.num_kv_splits
     };
 
     typename ReductionSplitKernel::Arguments reduce_arg {
@@ -1083,7 +1087,7 @@ struct FMHAConfig {
         std::cerr << "Error: Persistent kernel does not support paged/cached KV cache (use_paged_kv or seq_len_kv_cache > 0)." << std::endl;
         return -1;
       }
-      return run<false, false, false, cutlass::fmha::kernel::XeFHMAIndividualPersistentTileScheduler>(options);
+      return run<false, false, false, cutlass::fmha::kernel::XeFHMAPersistentTileScheduler>(options);
     } else if (options.use_paged_kv && !options.varlen) {
       return run<false, true, false, cutlass::fmha::kernel::XeFHMAIndividualTileScheduler>(options);
     } else if(!options.use_paged_kv && options.varlen) {
@@ -1093,7 +1097,7 @@ struct FMHAConfig {
       return splitkv ? run<false, false, true, cutlass::fmha::kernel::XeFHMAIndividualTileScheduler>(options) :
                        run<false, false, false, cutlass::fmha::kernel::XeFHMAIndividualTileScheduler>(options);
     } else {
-      return run<true, true, cutlass::fmha::kernel::XeFHMAIndividualTileScheduler>(options);
+      return run<true, true, false, cutlass::fmha::kernel::XeFHMAIndividualTileScheduler>(options);
     }
   }
 };
