@@ -114,6 +114,8 @@ public:
   struct SharedStorage {
     cutlass::Array<ElementLSE, FMHAKernel_::max_num_kv_splits> max_logits_slm_array;
     cutlass::Array<ElementLSE, FMHAKernel_::max_num_kv_splits> exp_sums_slm_array;
+    // num kv splits limit to 20, head size limit to 128 for now
+    cutlass::Array<ElementO, 128 * 40> o_accum_slm_array;
   };
 
   static constexpr int SharedStorageSize = is_empty_v<SharedStorage> ? size_t(0)
@@ -160,10 +162,19 @@ public:
     }
   }
 
+  template <typename T> auto get_multi_ptr(T *raw_ptr) {
+    auto multi_ptr =
+        sycl::address_space_cast<sycl::access::address_space::global_space,
+                                sycl::access::decorated::yes>(raw_ptr);
+
+    return multi_ptr;
+  }
+
   /// Perform a reduction
   CUTLASS_DEVICE
   void operator()(Params const &params, char *smem_buf) {
     using namespace sycl::ext::oneapi::this_work_item;
+    using namespace compat::experimental::sycl_exp;
 
     SharedStorage& shared_storage = *reinterpret_cast<SharedStorage *>(smem_buf);
 
@@ -173,6 +184,8 @@ public:
     int thr_id = int(ThreadIdxX());
     int sub_group_id = thr_id / intel::sg_size;
     int tid_in_sg = thr_id % intel::sg_size;
+
+    auto sg = get_sub_group();
 
     TileScheduler tile_scheduler{params.scheduler};
     auto num_kv_splits = params.scheduler.num_kv_splits;
@@ -244,6 +257,32 @@ public:
         shared_storage.exp_sums_slm_array[thr_id] = cur_exp_sum;
       }
 
+      // for (int i = 0; i < num_kv_splits; ++i) {
+      //   // load Oaccum into SLM
+      //   for (int idx = thr_id; idx < head_size_vo; idx += SGPerWG::value * intel::sg_size) {
+      //     shared_storage.o_accum_slm_array[i * head_size_vo + idx] = static_cast<ElementLSE>(Oaccum(seq_idx, idx, i * num_heads_q + head_q, l_coord));
+      //   }
+      // }
+
+      constexpr int vec_size = 4;
+      for (int i = 0; i < num_kv_splits; ++i) {
+        // load Oaccum into SLM
+        for (int idx = 0; idx < head_size_vo; idx += intel::sg_size * vec_size) {
+          // TODO wuxun: use vectorized load
+          // assume var_len is true or l_coord is always 0
+          auto tmp_o_accum = dcOaccum + i * num_heads_q * seq_len_qo * head_size_vo
+                              + head_q * seq_len_qo * head_size_vo
+                              + seq_idx * head_size_vo
+                              + idx + tid_in_sg * vec_size;
+          sycl::vec<ElementO, vec_size> vec_data;
+          group_load(sg, get_multi_ptr(tmp_o_accum), vec_data);
+          CUTLASS_PRAGMA_UNROLL
+          for (int v = 0; v < vec_size; ++v) {
+            shared_storage.o_accum_slm_array[i * head_size_vo + idx + v * tid_in_sg] = static_cast<ElementO>(vec_data[v]);
+          }
+        }
+      }
+
       // barrier for SLM writes finished
       sycl::group_barrier(get_work_group<3>());
 
@@ -254,22 +293,22 @@ public:
       global_max_logits = sycl::group_broadcast(get_work_group<1>(), global_max_logits, 0);
 
       // double buffer for Oaccum prefetch
-      cutlass::Array<ElementLSE, 2> o_accum_buffer;
+      // cutlass::Array<ElementLSE, 2> o_accum_buffer;
 
       // step 2: rescale Oaccum and write back to O
       for (int idx = thr_id; idx < s.head_size_vo; idx += SGPerWG::value * intel::sg_size) {
         ElementLSE acc = 0;
         ElementLSE global_exp_sums {0};
-        o_accum_buffer[0] = static_cast<ElementLSE>(Oaccum(seq_idx, idx, 0 * num_heads_q + head_q, l_coord));
+        // o_accum_buffer[0] = static_cast<ElementLSE>(Oaccum(seq_idx, idx, 0 * num_heads_q + head_q, l_coord));
 
-        #pragma unroll 2
+        // #pragma unroll 2
         for (int i = 0; i < FMHAKernel_::max_num_kv_splits; ++i) {
           if (i * num_blocks_per_split >= k_blocks) {
             break;
           }
           // prefetch next o_accum
-          if (i + 1 < FMHAKernel_::max_num_kv_splits && (i + 1) * num_blocks_per_split < k_blocks)
-            o_accum_buffer[(i + 1) & 1] = static_cast<ElementLSE>(Oaccum(seq_idx, idx, (i + 1) * num_heads_q + head_q, l_coord));
+          // if (i + 1 < FMHAKernel_::max_num_kv_splits && (i + 1) * num_blocks_per_split < k_blocks)
+          //   o_accum_buffer[(i + 1) & 1] = static_cast<ElementLSE>(Oaccum(seq_idx, idx, (i + 1) * num_heads_q + head_q, l_coord));
 
           ElementLSE local_max_logit = shared_storage.max_logits_slm_array[i];
           ElementLSE local_exp_sum = shared_storage.exp_sums_slm_array[i];
@@ -278,7 +317,8 @@ public:
 
           // in FMHA epilogue, it's divided by local_exp_sum, here we multiply back
           auto rescaled_local_exp_sum = local_exp_sum * rescale;
-          acc += o_accum_buffer[i & 1] * rescaled_local_exp_sum;
+          // acc += o_accum_buffer[i & 1] * rescaled_local_exp_sum;
+          acc += shared_storage.o_accum_slm_array[i * head_size_vo + idx] * rescaled_local_exp_sum;
 
           // update global exp sum
           global_exp_sums += rescaled_local_exp_sum;
